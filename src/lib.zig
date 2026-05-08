@@ -55,6 +55,7 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
             defer gpa.free(body);
             try html.convertWithOptions(gpa, &writer, body, .{
                 .readable = opts.readable orelse true,
+                .base_url = p,
             });
             return try writer.toOwnedSlice();
         }
