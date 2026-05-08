@@ -2,9 +2,12 @@
 //! Algorithm and default rules ported from mixmark-io/turndown (MIT).
 //! See docs/research.md §3.12.
 //!
-//! Strategy: parse with libxml2, post-order traverse, each element is converted
-//! by concatenating children then applying a tag-specific rule. List/table
-//! nesting handled via a small recursion-aware context.
+//! Architecture: every element rendering decision is a `Rule` in a priority-
+//! ordered registry. The dispatcher walks the DOM post-order; for each
+//! element it scans `default_rules` and invokes the first matching rule's
+//! render function. Rules that need to control child traversal (lists,
+//! tables, pre blocks) recurse manually via `renderChildren` / `renderNode`
+//! on the context. Adding a new tag = adding a Rule to the array.
 
 const std = @import("std");
 const libxml2 = @import("../ffi/libxml2.zig");
@@ -13,14 +16,24 @@ const readability = @import("../util/readability.zig");
 
 pub const ConvertOptions = struct {
     readable: bool = false,
-    /// When set, relative href / src attributes are resolved against this
-    /// URL so the output contains usable absolute links.
+    /// Resolve relative href / src against this absolute URL.
     base_url: ?[]const u8 = null,
+    /// MdWriter style options (delimiters, fence, list markers, link style).
+    md_opts: md.Options = .{},
+    /// Enable GitHub-flavoured Markdown extensions (tables, strikethrough,
+    /// task lists). Default on; rarely useful to disable.
+    gfm: bool = true,
 };
 
-const ignore_tags = [_][]const u8{
-    "script", "style", "head",  "meta", "link",
-    "noscript", "nav",  "footer", "aside",
+pub const Rule = struct {
+    /// Tag names this rule matches (case-insensitive). Either set this or
+    /// `match`. `match` fires if both are set.
+    tags: []const []const u8 = &.{},
+    /// Custom matcher for tag-attribute combinations (e.g. checkbox input).
+    match: ?*const fn (libxml2.Node) bool = null,
+    /// Render the node. Implementations call back into `renderChildren` or
+    /// `renderNode` themselves when they need rendered child markup.
+    render: *const fn (*Ctx, libxml2.Node) anyerror![]u8,
 };
 
 const ListKind = enum { ul, ol };
@@ -29,12 +42,25 @@ const Ctx = struct {
     gpa: std.mem.Allocator,
     list_stack: std.ArrayList(ListFrame) = .empty,
     base_url: ?[]const u8 = null,
+    opts: md.Options = .{},
+    gfm: bool = true,
+    /// Reference-style link accumulator (`[text][N]\n\n[N]: url`).
+    refs: std.ArrayList([]u8) = .empty,
 
     const ListFrame = struct {
         kind: ListKind,
         index: usize,
     };
 };
+
+const ignore_tags = [_][]const u8{
+    "script",   "style",   "head",   "meta", "link",
+    "title",    "noscript",
+};
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
 
 pub fn convert(gpa: std.mem.Allocator, writer: *md.MdWriter, html: []const u8) !void {
     return convertWithOptions(gpa, writer, html, .{});
@@ -55,43 +81,47 @@ pub fn convertWithOptions(
         return;
     };
 
-    var ctx = Ctx{ .gpa = gpa, .base_url = opts.base_url };
+    var ctx = Ctx{
+        .gpa = gpa,
+        .base_url = opts.base_url,
+        .opts = opts.md_opts,
+        .gfm = opts.gfm,
+    };
     defer ctx.list_stack.deinit(gpa);
+    defer {
+        for (ctx.refs.items) |r| gpa.free(r);
+        ctx.refs.deinit(gpa);
+    }
 
     const out = try renderNode(&ctx, root);
     defer gpa.free(out);
 
-    const collapsed = try collapseBlankLines(gpa, out);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, std.mem.trim(u8, out, " \t\r\n"));
+
+    if (ctx.refs.items.len > 0) {
+        try buf.appendSlice(gpa, "\n\n");
+        for (ctx.refs.items) |line| {
+            try buf.appendSlice(gpa, line);
+            try buf.append(gpa, '\n');
+        }
+    }
+
+    const collapsed = try collapseBlankLines(gpa, buf.items);
     defer gpa.free(collapsed);
-    const trimmed = std.mem.trim(u8, collapsed, " \t\r\n");
-    try writer.rawBlock(trimmed);
+    try writer.rawBlock(std.mem.trim(u8, collapsed, " \t\r\n"));
     try writer.finish();
 }
 
-/// Collapse any run of 3+ '\n' down to exactly 2.
-fn collapseBlankLines(gpa: std.mem.Allocator, in: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var newline_run: usize = 0;
-    for (in) |c| {
-        if (c == '\n') {
-            newline_run += 1;
-            if (newline_run <= 2) try out.append(gpa, c);
-        } else {
-            newline_run = 0;
-            try out.append(gpa, c);
-        }
-    }
-    return out.toOwnedSlice(gpa);
-}
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
 
 fn renderNode(ctx: *Ctx, node: libxml2.Node) anyerror![]u8 {
     return switch (node.nodeType()) {
         .text, .cdata => blk: {
             const raw = try node.textContent(ctx.gpa);
-            // Drop whitespace-only text nodes between block elements (HTML
-            // pretty-printing artifact). Real inter-word whitespace inside
-            // a <p> contains non-space chars elsewhere in the same node.
             if (isAllWhitespace(raw)) {
                 ctx.gpa.free(raw);
                 break :blk try ctx.gpa.dupe(u8, "");
@@ -103,11 +133,25 @@ fn renderNode(ctx: *Ctx, node: libxml2.Node) anyerror![]u8 {
     };
 }
 
-fn isAllWhitespace(s: []const u8) bool {
-    for (s) |c| {
-        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') return false;
+fn renderElement(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const tag = node.name();
+    for (ignore_tags) |t| {
+        if (std.ascii.eqlIgnoreCase(tag, t)) return ctx.gpa.dupe(u8, "");
     }
-    return true;
+    for (default_rules) |rule| {
+        if (matchesRule(rule, node)) return rule.render(ctx, node);
+    }
+    // Default: pass through children unchanged.
+    return renderChildren(ctx, node);
+}
+
+fn matchesRule(rule: Rule, node: libxml2.Node) bool {
+    const name = node.name();
+    for (rule.tags) |t| {
+        if (eqIgnoreCase(name, t)) return true;
+    }
+    if (rule.match) |m| return m(node);
+    return false;
 }
 
 fn renderChildren(ctx: *Ctx, node: libxml2.Node) ![]u8 {
@@ -122,45 +166,42 @@ fn renderChildren(ctx: *Ctx, node: libxml2.Node) ![]u8 {
     return out.toOwnedSlice(ctx.gpa);
 }
 
-fn renderElement(ctx: *Ctx, node: libxml2.Node) ![]u8 {
-    const tag = node.name();
-    for (ignore_tags) |t| {
-        if (std.ascii.eqlIgnoreCase(tag, t)) return ctx.gpa.dupe(u8, "");
-    }
+// ---------------------------------------------------------------------------
+// Default rules (CommonMark + GFM, ported from turndown)
+// ---------------------------------------------------------------------------
 
-    // Block-level rules that don't recurse normally:
-    if (eqIgnoreCase(tag, "ul")) return renderList(ctx, node, .ul);
-    if (eqIgnoreCase(tag, "ol")) return renderList(ctx, node, .ol);
-    if (eqIgnoreCase(tag, "pre")) return renderPre(ctx, node);
+const default_rules = [_]Rule{
+    .{ .match = matchHeadingTag, .render = renderHeading },
+    .{ .tags = &.{"p"}, .render = renderParagraph },
+    .{ .tags = &.{"br"}, .render = renderBreak },
+    .{ .tags = &.{"hr"}, .render = renderHr },
+    .{ .tags = &.{ "em", "i" }, .render = renderEm },
+    .{ .tags = &.{ "strong", "b" }, .render = renderStrong },
+    .{ .tags = &.{ "del", "s", "strike" }, .render = renderStrikethrough },
+    .{ .tags = &.{"code"}, .render = renderCode },
+    .{ .tags = &.{"pre"}, .render = renderPre },
+    .{ .tags = &.{"blockquote"}, .render = renderBlockquote },
+    .{ .tags = &.{"a"}, .render = renderAnchor },
+    .{ .tags = &.{"img"}, .render = renderImage },
+    .{ .tags = &.{ "ul", "ol" }, .render = renderList },
+    .{ .tags = &.{"li"}, .render = renderListItem },
+    .{ .tags = &.{"table"}, .render = renderTable },
+    .{ .tags = &.{"dl"}, .render = renderDefList },
+    .{ .tags = &.{ "dt", "dd" }, .render = renderDefItem },
+    .{ .tags = &.{"figure"}, .render = renderFigure },
+    .{ .tags = &.{"figcaption"}, .render = renderFigcaption },
+    .{ .match = matchTaskCheckbox, .render = renderTaskCheckbox },
+    // Block container fall-throughs: render children with a trailing newline.
+    .{ .tags = &.{ "tr", "td", "th" }, .render = renderTableCellFallback },
+    .{ .tags = &.{ "div", "section", "article", "main" }, .render = renderBlockContainer },
+};
 
-    const inner = try renderChildren(ctx, node);
-    defer ctx.gpa.free(inner);
+// ---------------------------------------------------------------------------
+// Headings
+// ---------------------------------------------------------------------------
 
-    if (matchHeading(tag)) |level| return formatHeading(ctx.gpa, level, inner);
-    if (eqIgnoreCase(tag, "p")) return std.fmt.allocPrint(ctx.gpa, "\n\n{s}\n\n", .{trim(inner)});
-    if (eqIgnoreCase(tag, "br")) return ctx.gpa.dupe(u8, "  \n");
-    if (eqIgnoreCase(tag, "hr")) return ctx.gpa.dupe(u8, "\n\n---\n\n");
-    if (eqIgnoreCase(tag, "em") or eqIgnoreCase(tag, "i")) return wrap(ctx.gpa, "_", inner, "_");
-    if (eqIgnoreCase(tag, "strong") or eqIgnoreCase(tag, "b")) return wrap(ctx.gpa, "**", inner, "**");
-    if (eqIgnoreCase(tag, "code")) return wrap(ctx.gpa, "`", inner, "`");
-    if (eqIgnoreCase(tag, "blockquote")) return formatBlockquote(ctx.gpa, inner);
-    if (eqIgnoreCase(tag, "a")) return formatLink(ctx, node, inner);
-    if (eqIgnoreCase(tag, "img")) return formatImage(ctx, node);
-    if (eqIgnoreCase(tag, "li")) return std.fmt.allocPrint(ctx.gpa, "{s}", .{trim(inner)});
-
-    // Block-level table elements: HN-style table layouts use these as the
-    // primary structure, so newlines here turn one-line dumps into per-row
-    // lines. Real Markdown tables only get emitted when callers use the
-    // GFM table converter.
-    if (eqIgnoreCase(tag, "tr")) return std.fmt.allocPrint(ctx.gpa, "{s}\n", .{trim(inner)});
-    if (eqIgnoreCase(tag, "td") or eqIgnoreCase(tag, "th"))
-        return std.fmt.allocPrint(ctx.gpa, "{s} ", .{trim(inner)});
-    if (eqIgnoreCase(tag, "div") or eqIgnoreCase(tag, "section") or
-        eqIgnoreCase(tag, "article") or eqIgnoreCase(tag, "main"))
-        return std.fmt.allocPrint(ctx.gpa, "{s}\n", .{trim(inner)});
-
-    // Default: pass through children.
-    return ctx.gpa.dupe(u8, inner);
+fn matchHeadingTag(node: libxml2.Node) bool {
+    return matchHeading(node.name()) != null;
 }
 
 fn matchHeading(tag: []const u8) ?u8 {
@@ -170,68 +211,201 @@ fn matchHeading(tag: []const u8) ?u8 {
     return tag[1] - '0';
 }
 
-fn formatHeading(gpa: std.mem.Allocator, level: u8, inner: []const u8) ![]u8 {
+fn renderHeading(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const level = matchHeading(node.name()) orelse 1;
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const text = trim(inner);
+
+    if (ctx.opts.heading_style == .setext and level <= 2) {
+        const underline_char: u8 = if (level == 1) '=' else '-';
+        var underline: std.ArrayList(u8) = .empty;
+        defer underline.deinit(ctx.gpa);
+        try underline.appendNTimes(ctx.gpa, underline_char, @max(text.len, 3));
+        return std.fmt.allocPrint(ctx.gpa, "\n\n{s}\n{s}\n\n", .{ text, underline.items });
+    }
+
     var prefix: [8]u8 = undefined;
     var i: usize = 0;
     while (i < level) : (i += 1) prefix[i] = '#';
     prefix[i] = ' ';
-    return std.fmt.allocPrint(gpa, "\n\n{s}{s}\n\n", .{ prefix[0 .. level + 1], trim(inner) });
+    return std.fmt.allocPrint(ctx.gpa, "\n\n{s}{s}\n\n", .{ prefix[0 .. level + 1], text });
 }
 
-fn formatBlockquote(gpa: std.mem.Allocator, inner: []const u8) ![]u8 {
+// ---------------------------------------------------------------------------
+// Inline runs
+// ---------------------------------------------------------------------------
+
+fn renderParagraph(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return std.fmt.allocPrint(ctx.gpa, "\n\n{s}\n\n", .{trim(inner)});
+}
+
+fn renderBreak(ctx: *Ctx, _: libxml2.Node) ![]u8 {
+    return ctx.gpa.dupe(u8, "  \n");
+}
+
+fn renderHr(ctx: *Ctx, _: libxml2.Node) ![]u8 {
+    return ctx.gpa.dupe(u8, "\n\n---\n\n");
+}
+
+fn renderEm(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const delim: []const u8 = switch (ctx.opts.em_delimiter) {
+        .underscore => "_",
+        .star => "*",
+    };
+    return wrap(ctx.gpa, delim, inner, delim);
+}
+
+fn renderStrong(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const delim: []const u8 = switch (ctx.opts.strong_delimiter) {
+        .star_star => "**",
+        .underscore_underscore => "__",
+    };
+    return wrap(ctx.gpa, delim, inner, delim);
+}
+
+fn renderStrikethrough(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    if (!ctx.gfm) return ctx.gpa.dupe(u8, trim(inner));
+    return wrap(ctx.gpa, "~~", inner, "~~");
+}
+
+fn renderCode(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    // <code> outside <pre> = inline code; inside a <pre> the parent rule
+    // (renderPre) consumes us.
+    if (node.parent()) |p| {
+        if (eqIgnoreCase(p.name(), "pre")) return renderChildren(ctx, node);
+    }
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return wrap(ctx.gpa, "`", inner, "`");
+}
+
+// ---------------------------------------------------------------------------
+// Block code
+// ---------------------------------------------------------------------------
+
+fn renderPre(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const text = try node.textContent(ctx.gpa);
+    defer ctx.gpa.free(text);
+    const trimmed = trim(text);
+    const lang = try detectCodeLanguage(ctx.gpa, node);
+    defer ctx.gpa.free(lang);
+
+    if (ctx.opts.code_block_style == .indented) {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(ctx.gpa);
+        try out.appendSlice(ctx.gpa, "\n\n");
+        var it = std.mem.splitScalar(u8, trimmed, '\n');
+        while (it.next()) |line| {
+            try out.appendSlice(ctx.gpa, "    ");
+            try out.appendSlice(ctx.gpa, line);
+            try out.append(ctx.gpa, '\n');
+        }
+        try out.append(ctx.gpa, '\n');
+        return out.toOwnedSlice(ctx.gpa);
+    }
+
+    return std.fmt.allocPrint(ctx.gpa, "\n\n{s}{s}\n{s}\n{s}\n\n", .{
+        ctx.opts.fence, lang, trimmed, ctx.opts.fence,
+    });
+}
+
+/// Inspect <pre><code class="language-xxx"> for a hint. Returns owned string.
+fn detectCodeLanguage(gpa: std.mem.Allocator, pre: libxml2.Node) ![]u8 {
+    var c = pre.firstChild();
+    while (c) |child| : (c = child.next()) {
+        if (child.nodeType() != .element) continue;
+        if (!eqIgnoreCase(child.name(), "code")) continue;
+        if (try child.attr(gpa, "class")) |class| {
+            defer gpa.free(class);
+            // language-XXX or lang-XXX in any class token.
+            var it = std.mem.splitScalar(u8, class, ' ');
+            while (it.next()) |tok| {
+                if (std.mem.startsWith(u8, tok, "language-"))
+                    return gpa.dupe(u8, tok["language-".len..]);
+                if (std.mem.startsWith(u8, tok, "lang-"))
+                    return gpa.dupe(u8, tok["lang-".len..]);
+            }
+        }
+    }
+    return gpa.dupe(u8, "");
+}
+
+// ---------------------------------------------------------------------------
+// Block quote
+// ---------------------------------------------------------------------------
+
+fn renderBlockquote(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
     const trimmed = trim(inner);
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, "\n\n");
+    errdefer out.deinit(ctx.gpa);
+    try out.appendSlice(ctx.gpa, "\n\n");
     var it = std.mem.splitScalar(u8, trimmed, '\n');
     var first = true;
     while (it.next()) |line| {
-        if (!first) try out.append(gpa, '\n');
+        if (!first) try out.append(ctx.gpa, '\n');
         first = false;
-        try out.appendSlice(gpa, "> ");
-        try out.appendSlice(gpa, line);
+        try out.appendSlice(ctx.gpa, "> ");
+        try out.appendSlice(ctx.gpa, line);
     }
-    try out.appendSlice(gpa, "\n\n");
-    return out.toOwnedSlice(gpa);
+    try out.appendSlice(ctx.gpa, "\n\n");
+    return out.toOwnedSlice(ctx.gpa);
 }
 
-fn formatLink(ctx: *Ctx, node: libxml2.Node, inner: []const u8) ![]u8 {
-    const href = (try node.attr(ctx.gpa, "href")) orelse return ctx.gpa.dupe(u8, inner);
-    defer ctx.gpa.free(href);
-    const trimmed_inner = trim(inner);
-    // [](url) form: anchor wrapping just an icon image we already dropped,
-    // or a navigation arrow with no visible text. Skip it entirely.
-    if (trimmed_inner.len == 0) return ctx.gpa.dupe(u8, "");
-    const resolved = try resolveUrl(ctx, href);
+// ---------------------------------------------------------------------------
+// Links + images
+// ---------------------------------------------------------------------------
+
+fn renderAnchor(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const trimmed = trim(inner);
+    const href_opt = try node.attr(ctx.gpa, "href");
+    if (href_opt == null) return ctx.gpa.dupe(u8, trimmed);
+    defer ctx.gpa.free(href_opt.?);
+    if (trimmed.len == 0) return ctx.gpa.dupe(u8, "");
+    const resolved = try resolveUrl(ctx, href_opt.?);
     defer ctx.gpa.free(resolved);
-    return std.fmt.allocPrint(ctx.gpa, "[{s}]({s})", .{ trimmed_inner, resolved });
+
+    if (ctx.opts.link_style == .referenced) {
+        const idx = ctx.refs.items.len + 1;
+        const ref_line = try std.fmt.allocPrint(ctx.gpa, "[{d}]: {s}", .{ idx, resolved });
+        try ctx.refs.append(ctx.gpa, ref_line);
+        return std.fmt.allocPrint(ctx.gpa, "[{s}][{d}]", .{ trimmed, idx });
+    }
+    return std.fmt.allocPrint(ctx.gpa, "[{s}]({s})", .{ trimmed, resolved });
 }
 
-fn formatImage(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+fn renderImage(ctx: *Ctx, node: libxml2.Node) ![]u8 {
     const src = (try node.attr(ctx.gpa, "src")) orelse return ctx.gpa.dupe(u8, "");
     defer ctx.gpa.free(src);
     const alt_opt = try node.attr(ctx.gpa, "alt");
     defer if (alt_opt) |a| ctx.gpa.free(a);
-    const alt = alt_opt orelse "";
     const resolved = try resolveUrl(ctx, src);
     defer ctx.gpa.free(resolved);
-    return std.fmt.allocPrint(ctx.gpa, "![{s}]({s})", .{ alt, resolved });
+    return std.fmt.allocPrint(ctx.gpa, "![{s}]({s})", .{ alt_opt orelse "", resolved });
 }
 
-fn renderPre(ctx: *Ctx, node: libxml2.Node) ![]u8 {
-    // Try to find a child <code> for the language; otherwise emit children as-is.
-    const text = try node.textContent(ctx.gpa);
-    defer ctx.gpa.free(text);
-    const trimmed = trim(text);
-    return std.fmt.allocPrint(ctx.gpa, "\n\n```\n{s}\n```\n\n", .{trimmed});
-}
+// ---------------------------------------------------------------------------
+// Lists
+// ---------------------------------------------------------------------------
 
-fn renderList(ctx: *Ctx, node: libxml2.Node, kind: ListKind) ![]u8 {
+fn renderList(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const kind: ListKind = if (eqIgnoreCase(node.name(), "ol")) .ol else .ul;
     try ctx.list_stack.append(ctx.gpa, .{ .kind = kind, .index = 1 });
     defer _ = ctx.list_stack.pop();
 
     const depth = ctx.list_stack.items.len - 1;
-
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.gpa);
     if (depth == 0) try out.appendSlice(ctx.gpa, "\n\n");
@@ -240,6 +414,7 @@ fn renderList(ctx: *Ctx, node: libxml2.Node, kind: ListKind) ![]u8 {
     while (c) |child| : (c = child.next()) {
         if (child.nodeType() != .element) continue;
         if (!eqIgnoreCase(child.name(), "li")) continue;
+
         const inner = try renderChildren(ctx, child);
         defer ctx.gpa.free(inner);
 
@@ -248,7 +423,14 @@ fn renderList(ctx: *Ctx, node: libxml2.Node, kind: ListKind) ![]u8 {
 
         const frame = &ctx.list_stack.items[ctx.list_stack.items.len - 1];
         switch (frame.kind) {
-            .ul => try out.appendSlice(ctx.gpa, "* "),
+            .ul => {
+                const marker: []const u8 = switch (ctx.opts.bullet_marker) {
+                    .star => "* ",
+                    .dash => "- ",
+                    .plus => "+ ",
+                };
+                try out.appendSlice(ctx.gpa, marker);
+            },
             .ol => {
                 const marker = try std.fmt.allocPrint(ctx.gpa, "{d}. ", .{frame.index});
                 defer ctx.gpa.free(marker);
@@ -263,6 +445,236 @@ fn renderList(ctx: *Ctx, node: libxml2.Node, kind: ListKind) ![]u8 {
     return out.toOwnedSlice(ctx.gpa);
 }
 
+fn renderListItem(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    // <li> reached without parent ul/ol — render inline.
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return ctx.gpa.dupe(u8, trim(inner));
+}
+
+// ---------------------------------------------------------------------------
+// GFM task list checkbox: <input type="checkbox"> inside an <li>.
+// ---------------------------------------------------------------------------
+
+fn matchTaskCheckbox(node: libxml2.Node) bool {
+    return eqIgnoreCase(node.name(), "input");
+}
+
+fn renderTaskCheckbox(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    if (!ctx.gfm) return ctx.gpa.dupe(u8, "");
+    const t = (try node.attr(ctx.gpa, "type")) orelse return ctx.gpa.dupe(u8, "");
+    defer ctx.gpa.free(t);
+    if (!std.ascii.eqlIgnoreCase(t, "checkbox")) return ctx.gpa.dupe(u8, "");
+    const checked_opt = try node.attr(ctx.gpa, "checked");
+    if (checked_opt) |s| ctx.gpa.free(s);
+    return ctx.gpa.dupe(u8, if (checked_opt != null) "[x] " else "[ ] ");
+}
+
+// ---------------------------------------------------------------------------
+// GFM tables
+// ---------------------------------------------------------------------------
+
+fn renderTable(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    if (!ctx.gfm) return renderTableFallback(ctx, node);
+    // HN-style layout tables have neither <thead> nor <th>. Only treat
+    // tables with explicit data-table markers as Markdown tables; fall
+    // back to block container behaviour otherwise.
+    if (!isDataTable(node)) return renderTableFallback(ctx, node);
+
+    var rows: std.ArrayList([]const []u8) = .empty;
+    defer {
+        for (rows.items) |row| {
+            for (row) |cell| ctx.gpa.free(cell);
+            ctx.gpa.free(row);
+        }
+        rows.deinit(ctx.gpa);
+    }
+
+    try collectRowsFromTable(ctx, node, &rows);
+    if (rows.items.len == 0) return ctx.gpa.dupe(u8, "");
+
+    // Pad rows to max column count.
+    var ncols: usize = 0;
+    for (rows.items) |row| ncols = @max(ncols, row.len);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.gpa);
+    try out.appendSlice(ctx.gpa, "\n\n");
+    for (rows.items, 0..) |row, ri| {
+        try out.append(ctx.gpa, '|');
+        var col: usize = 0;
+        while (col < ncols) : (col += 1) {
+            try out.append(ctx.gpa, ' ');
+            const cell = if (col < row.len) row[col] else "";
+            try writeTableCellEscaped(ctx.gpa, &out, cell);
+            try out.appendSlice(ctx.gpa, " |");
+        }
+        try out.append(ctx.gpa, '\n');
+        if (ri == 0) {
+            try out.append(ctx.gpa, '|');
+            var c: usize = 0;
+            while (c < ncols) : (c += 1) try out.appendSlice(ctx.gpa, " --- |");
+            try out.append(ctx.gpa, '\n');
+        }
+    }
+    try out.append(ctx.gpa, '\n');
+    return out.toOwnedSlice(ctx.gpa);
+}
+
+fn collectRowsFromTable(
+    ctx: *Ctx,
+    node: libxml2.Node,
+    rows: *std.ArrayList([]const []u8),
+) anyerror!void {
+    var c = node.firstChild();
+    while (c) |child| : (c = child.next()) {
+        if (child.nodeType() != .element) continue;
+        const name = child.name();
+        if (eqIgnoreCase(name, "thead") or eqIgnoreCase(name, "tbody") or
+            eqIgnoreCase(name, "tfoot"))
+        {
+            try collectRowsFromTable(ctx, child, rows);
+            continue;
+        }
+        if (!eqIgnoreCase(name, "tr")) continue;
+
+        var cells: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (cells.items) |cc| ctx.gpa.free(cc);
+            cells.deinit(ctx.gpa);
+        }
+        var cc = child.firstChild();
+        while (cc) |cell_node| : (cc = cell_node.next()) {
+            if (cell_node.nodeType() != .element) continue;
+            const cn = cell_node.name();
+            if (!eqIgnoreCase(cn, "td") and !eqIgnoreCase(cn, "th")) continue;
+            const cell_md = try renderChildren(ctx, cell_node);
+            try cells.append(ctx.gpa, cell_md);
+        }
+        try rows.append(ctx.gpa, try cells.toOwnedSlice(ctx.gpa));
+    }
+}
+
+fn writeTableCellEscaped(gpa: std.mem.Allocator, out: *std.ArrayList(u8), cell: []const u8) !void {
+    for (trim(cell)) |c| switch (c) {
+        '|' => try out.appendSlice(gpa, "\\|"),
+        '\n', '\r' => try out.append(gpa, ' '),
+        else => try out.append(gpa, c),
+    };
+}
+
+fn renderTableFallback(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    return renderChildren(ctx, node);
+}
+
+/// True when `table` has any <thead> or <th> descendant — a strong signal
+/// that this is a data table rather than a CSS-replacement layout grid.
+fn isDataTable(table: libxml2.Node) bool {
+    return hasDescendantNamed(table, "thead") or hasDescendantNamed(table, "th");
+}
+
+fn hasDescendantNamed(node: libxml2.Node, target: []const u8) bool {
+    var c = node.firstChild();
+    while (c) |child| : (c = child.next()) {
+        if (child.nodeType() != .element) continue;
+        if (eqIgnoreCase(child.name(), target)) return true;
+        if (hasDescendantNamed(child, target)) return true;
+    }
+    return false;
+}
+
+fn renderTableCellFallback(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    // Reached only when not inside a <table> we fully consumed (e.g. layout
+    // tables with stray cells). Emit children with a separator.
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    if (eqIgnoreCase(node.name(), "tr")) {
+        return std.fmt.allocPrint(ctx.gpa, "{s}\n", .{trim(inner)});
+    }
+    return std.fmt.allocPrint(ctx.gpa, "{s} ", .{trim(inner)});
+}
+
+// ---------------------------------------------------------------------------
+// Definition lists, figures
+// ---------------------------------------------------------------------------
+
+fn renderDefList(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return std.fmt.allocPrint(ctx.gpa, "\n\n{s}\n\n", .{trim(inner)});
+}
+
+fn renderDefItem(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const text = trim(inner);
+    if (eqIgnoreCase(node.name(), "dt")) {
+        // Term: bold + paragraph break.
+        return std.fmt.allocPrint(ctx.gpa, "\n\n**{s}**\n", .{text});
+    }
+    // <dd>: 4-space indent (Markdown convention for definitions).
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        try out.appendSlice(ctx.gpa, ": ");
+        try out.appendSlice(ctx.gpa, line);
+        try out.append(ctx.gpa, '\n');
+    }
+    return out.toOwnedSlice(ctx.gpa);
+}
+
+fn renderFigure(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return std.fmt.allocPrint(ctx.gpa, "\n\n{s}\n\n", .{trim(inner)});
+}
+
+fn renderFigcaption(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    const text = trim(inner);
+    if (text.len == 0) return ctx.gpa.dupe(u8, "");
+    return std.fmt.allocPrint(ctx.gpa, "\n_{s}_\n", .{text});
+}
+
+// ---------------------------------------------------------------------------
+// Generic block container
+// ---------------------------------------------------------------------------
+
+fn renderBlockContainer(ctx: *Ctx, node: libxml2.Node) ![]u8 {
+    const inner = try renderChildren(ctx, node);
+    defer ctx.gpa.free(inner);
+    return std.fmt.allocPrint(ctx.gpa, "{s}\n", .{trim(inner)});
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn isAllWhitespace(s: []const u8) bool {
+    for (s) |c| {
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') return false;
+    }
+    return true;
+}
+
+fn collapseBlankLines(gpa: std.mem.Allocator, in: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var nl_run: usize = 0;
+    for (in) |c| {
+        if (c == '\n') {
+            nl_run += 1;
+            if (nl_run <= 2) try out.append(gpa, c);
+        } else {
+            nl_run = 0;
+            try out.append(gpa, c);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn wrap(gpa: std.mem.Allocator, lhs: []const u8, inner: []const u8, rhs: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ lhs, trim(inner), rhs });
 }
@@ -271,12 +683,17 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
-/// Resolve a possibly-relative URL against the page's base URL. Falls back
-/// to the original input when no base is set or parsing fails.
+fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// URL resolution
+// ---------------------------------------------------------------------------
+
 fn resolveUrl(ctx: *Ctx, href: []const u8) ![]u8 {
     const trimmed_href = std.mem.trim(u8, href, " \t\r\n");
     if (trimmed_href.len == 0) return ctx.gpa.dupe(u8, "");
-    // Already-absolute / data / fragments / mailto.
     if (std.mem.startsWith(u8, trimmed_href, "http://") or
         std.mem.startsWith(u8, trimmed_href, "https://") or
         std.mem.startsWith(u8, trimmed_href, "data:") or
@@ -287,7 +704,6 @@ fn resolveUrl(ctx: *Ctx, href: []const u8) ![]u8 {
         return ctx.gpa.dupe(u8, trimmed_href);
     }
     const base = ctx.base_url orelse return ctx.gpa.dupe(u8, trimmed_href);
-    // Protocol-relative '//host/path' inherits scheme from base.
     if (std.mem.startsWith(u8, trimmed_href, "//")) {
         const scheme_end = std.mem.indexOf(u8, base, "://") orelse return ctx.gpa.dupe(u8, trimmed_href);
         return std.fmt.allocPrint(ctx.gpa, "{s}:{s}", .{ base[0..scheme_end], trimmed_href });
@@ -295,27 +711,24 @@ fn resolveUrl(ctx: *Ctx, href: []const u8) ![]u8 {
     return joinUrl(ctx.gpa, base, trimmed_href) catch ctx.gpa.dupe(u8, trimmed_href);
 }
 
-/// Minimal RFC 3986 §5.2 reference resolution: path-relative join.
 fn joinUrl(gpa: std.mem.Allocator, base: []const u8, ref: []const u8) ![]u8 {
     const scheme_end = std.mem.indexOf(u8, base, "://") orelse return gpa.dupe(u8, ref);
     const authority_start = scheme_end + 3;
     var path_start = base.len;
     if (std.mem.indexOfScalarPos(u8, base, authority_start, '/')) |idx| path_start = idx;
 
-    // Strip query / fragment from base path.
     var base_path_end = base.len;
     if (std.mem.indexOfScalarPos(u8, base, path_start, '?')) |idx|
         base_path_end = @min(base_path_end, idx);
     if (std.mem.indexOfScalarPos(u8, base, path_start, '#')) |idx|
         base_path_end = @min(base_path_end, idx);
 
-    const origin = base[0..path_start]; // scheme://authority
+    const origin = base[0..path_start];
     const base_path = base[path_start..base_path_end];
 
     if (std.mem.startsWith(u8, ref, "/")) {
         return std.fmt.allocPrint(gpa, "{s}{s}", .{ origin, ref });
     }
-    // Strip last segment off base_path to get the directory.
     var dir_end: usize = base_path.len;
     while (dir_end > 0 and base_path[dir_end - 1] != '/') dir_end -= 1;
     const base_dir = if (dir_end == 0) "/" else base_path[0..dir_end];
@@ -337,23 +750,47 @@ test "joinUrl resolves relative refs" {
     }
 }
 
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
-}
+// ---------------------------------------------------------------------------
+// Text escape (CommonMark-aware, ported from turndown utilities.escape).
+// ---------------------------------------------------------------------------
 
-/// Conservative escape for text nodes. Mirror of md_writer's escape but operating
-/// on already-decoded UTF-8 from libxml2 (no need to re-decode entities).
+/// Escape characters in `text` that would change Markdown structure.
+/// Position-aware: some chars only need escaping at line start (#, +, -, >),
+/// some inside a digit-prefixed line start (e.g. `1.`), some everywhere.
 fn escapeText(gpa: std.mem.Allocator, text: []u8, free_input: bool) ![]u8 {
     defer if (free_input) gpa.free(text);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    for (text) |ch| {
-        const needs = switch (ch) {
-            '\\', '`', '*', '_', '[', ']' => true,
+    var at_line_start = true;
+    var pending_digits = false; // true inside a digit run at start-of-line
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        const next: ?u8 = if (i + 1 < text.len) text[i + 1] else null;
+
+        const escape_always = switch (c) {
+            '\\', '`', '*', '_', '[', ']', '<', '>' => true,
+            '~' => next != null and next.? == '~', // ~~ is GFM strike
+            '!' => next != null and next.? == '[', // ![alt](src)
             else => false,
         };
-        if (needs) try out.append(gpa, '\\');
-        try out.append(gpa, ch);
+        const escape_at_line_start = switch (c) {
+            '#', '-', '+', '>' => at_line_start,
+            '|' => at_line_start, // GFM pipe-table row
+            else => false,
+        };
+        // 1. / 2. at line start = ordered list start.
+        const is_digit = std.ascii.isDigit(c);
+        const escape_digit_period = pending_digits and c == '.';
+        if (is_digit and at_line_start) pending_digits = true;
+        if (!is_digit) pending_digits = false;
+
+        if (escape_always or escape_at_line_start or escape_digit_period) {
+            try out.append(gpa, '\\');
+        }
+        try out.append(gpa, c);
+        at_line_start = (c == '\n');
+        if (at_line_start) pending_digits = false;
     }
     return out.toOwnedSlice(gpa);
 }
