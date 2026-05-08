@@ -76,7 +76,10 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .html => try html.convertWithOptions(gpa, &writer, data, .{
             .readable = opts.readable orelse false,
         }),
-        .pdf => try pdf.convert(gpa, &writer, data, .{ .pages = opts.pdf_pages }),
+        .pdf => try pdf.convert(gpa, &writer, data, .{
+            .pages = opts.pdf_pages,
+            .ocr_scanned = opts.ocr,
+        }),
         .docx => try docx.convert(gpa, &writer, data),
         .xlsx => try xlsx.convert(gpa, &writer, data),
         .pptx => try pptx.convert(gpa, &writer, data),

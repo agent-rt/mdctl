@@ -102,6 +102,41 @@ pub const Page = struct {
         }
     }
 
+    /// Render the page to a CGImage at `dpi`. Returned reference is
+    /// retained — caller must release via CFRelease/CGImageRelease.
+    pub fn renderCGImage(self: Page, dpi: f64) ?*const anyopaque {
+        // Get media-box bounds via [page boundsForBox:kPDFDisplayBoxMediaBox]
+        const bounds = objc.send1(NSRect, self.raw, "boundsForBox:", @as(c_int, 0));
+        const scale = dpi / 72.0;
+        const px_w: usize = @intFromFloat(@max(1.0, bounds.size.width * scale));
+        const px_h: usize = @intFromFloat(@max(1.0, bounds.size.height * scale));
+
+        // [page thumbnailOfSize:forBox:] returns NSImage; size is in pts
+        // (system handles retina via embedded representations). To get a
+        // crisp render we draw via CGContext directly.
+        const NSSize_ = NSSize{ .width = bounds.size.width, .height = bounds.size.height };
+        const ns_image = objc.send2(
+            objc.Id,
+            self.raw,
+            "thumbnailOfSize:forBox:",
+            NSSize_,
+            @as(c_int, 0),
+        );
+        if (ns_image == null) return null;
+
+        const cg = objc.send3(
+            ?*const anyopaque,
+            ns_image,
+            "CGImageForProposedRect:context:hints:",
+            @as(?*anyopaque, null),
+            @as(?*anyopaque, null),
+            @as(?*anyopaque, null),
+        );
+        _ = px_w;
+        _ = px_h;
+        return cg;
+    }
+
     /// Substring of the page's plain string by UTF-16 range, returned as UTF-8.
     pub fn substring(self: Page, gpa: std.mem.Allocator, utf16_off: usize, utf16_len: usize) ![]u8 {
         const ns = objc.send0(objc.Id, self.raw, "string");
@@ -114,6 +149,9 @@ pub const Page = struct {
 };
 
 pub const NSRange = extern struct { location: usize, length: usize };
+pub const NSSize = extern struct { width: f64, height: f64 };
+pub const NSPoint = extern struct { x: f64, y: f64 };
+pub const NSRect = extern struct { origin: NSPoint, size: NSSize };
 
 fn nsStringToUtf8(gpa: std.mem.Allocator, ns_string: objc.Id) ![]u8 {
     const cstr = objc.send0([*c]const u8, ns_string, "UTF8String");

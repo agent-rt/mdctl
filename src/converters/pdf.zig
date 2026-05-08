@@ -13,7 +13,12 @@
 const std = @import("std");
 const objc = @import("../ffi/objc.zig");
 const pdfkit = @import("../ffi/pdfkit.zig");
+const vision = @import("../ffi/vision.zig");
 const md = @import("../md_writer.zig");
+
+/// Pages whose extracted text is shorter than this threshold are treated as
+/// scanned and run through Vision OCR instead.
+const scanned_threshold = 16;
 
 pub const Range = struct {
     start: usize, // 1-based inclusive
@@ -22,6 +27,9 @@ pub const Range = struct {
 
 pub const ConvertOptions = struct {
     pages: []const Range = &.{},
+    /// Run Vision OCR on pages whose extracted text is below
+    /// `scanned_threshold`. Off by default — opt-in via --ocr.
+    ocr_scanned: bool = false,
 };
 
 pub fn convert(
@@ -59,6 +67,13 @@ pub fn convert(
         defer objc.popPool(inner);
 
         var lines = try collectPageLines(gpa, page);
+        if (opts.ocr_scanned and totalTextLen(&lines) < scanned_threshold) {
+            // Page looks scanned — drop the (mostly empty) lines and replace
+            // with Vision OCR output as paragraph(s).
+            for (lines.lines.items) |line| gpa.free(line.text);
+            lines.lines.clearRetainingCapacity();
+            try ocrPageInto(gpa, page, &lines);
+        }
         try pages.append(gpa, lines);
         _ = &lines;
     }
@@ -176,6 +191,30 @@ fn maxSize(slice: []const f64) f64 {
         m = v;
     };
     return m;
+}
+
+fn totalTextLen(p: *const PageLines) usize {
+    var n: usize = 0;
+    for (p.lines.items) |line| {
+        n += std.mem.trim(u8, line.text, " \t\r\n").len;
+    }
+    return n;
+}
+
+fn ocrPageInto(gpa: std.mem.Allocator, page: pdfkit.Page, out: *PageLines) !void {
+    const cg = page.renderCGImage(200) orelse return;
+    const text = vision.recognizeCGImage(gpa, cg, .{}) catch return;
+    defer gpa.free(text);
+
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try out.lines.append(gpa, .{
+            .text = try gpa.dupe(u8, trimmed),
+            .size = 0, // unknown — never classified as heading
+        });
+    }
 }
 
 // ============================================================================

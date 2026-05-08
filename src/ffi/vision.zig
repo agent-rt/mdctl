@@ -42,6 +42,29 @@ pub fn recognizePath(gpa: std.mem.Allocator, path: []const u8, opts: Options) ![
     return performAndCollect(gpa, handler, opts);
 }
 
+/// Run OCR on an existing CGImageRef. Caller retains ownership of `cg`.
+pub fn recognizeCGImage(gpa: std.mem.Allocator, cg: ?*const anyopaque, opts: Options) ![]u8 {
+    if (!enabled) return error.UnsupportedFormat;
+    if (cg == null) return error.BadInput;
+
+    const NSDictionary = objc.getClass("NSDictionary");
+    const empty_opts = objc.send0(objc.Id, NSDictionary, "dictionary");
+
+    const VNImageRequestHandler = objc.getClass("VNImageRequestHandler");
+    const handler_alloc = objc.send0(objc.Id, VNImageRequestHandler, "alloc");
+    const handler = objc.send2(
+        objc.Id,
+        handler_alloc,
+        "initWithCGImage:options:",
+        cg,
+        empty_opts,
+    );
+    if (handler == null) return error.ConvertFailed;
+    defer _ = objc.send0(objc.Id, handler, "release");
+
+    return performAndCollect(gpa, handler, opts);
+}
+
 fn performAndCollect(gpa: std.mem.Allocator, handler: objc.Id, opts: Options) ![]u8 {
     // Build NSArray of NSString languages.
     var lang_objs: [16]objc.Id = undefined;
