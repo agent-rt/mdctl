@@ -83,8 +83,16 @@ pub fn convert(
 
     var pending_para: std.ArrayList(u8) = .empty;
     defer pending_para.deinit(gpa);
+    var last_heading: std.ArrayList(u8) = .empty;
+    defer last_heading.deinit(gpa);
+    var lines_since_heading: usize = 0;
 
     for (pages.items) |page_data| {
+        // Page boundary: flush whatever was buffered. Otherwise the last
+        // line of page N and the first line of page N+1 get joined by the
+        // reflow heuristic into one paragraph (e.g. "...ください。 Microsoft,
+        // Windows..."), which never reads as one paragraph in the source.
+        try flushPara(gpa, writer, &pending_para);
         for (page_data.lines.items) |line| {
             if (line.skipped) continue;
             const trimmed_text = std.mem.trim(u8, line.text, " \t\r\n");
@@ -92,12 +100,24 @@ pub fn convert(
             if (lvl_opt) |h| {
                 if (looksLikeHeading(trimmed_text)) {
                     try flushPara(gpa, writer, &pending_para);
-                    try writer.heading(h, trimmed_text);
+                    // Drop near-duplicate consecutive headings — e.g.
+                    // table-of-contents entry rendered just above the
+                    // chapter start ('使用条件' / '## ２． 使用条件').
+                    const norm = normalizeHeadingText(trimmed_text);
+                    const last_norm = normalizeHeadingText(last_heading.items);
+                    const is_dup = lines_since_heading <= 1 and
+                        last_norm.len > 0 and norm.len > 0 and
+                        (std.mem.eql(u8, norm, last_norm) or
+                            std.mem.indexOf(u8, norm, last_norm) != null or
+                            std.mem.indexOf(u8, last_norm, norm) != null);
+                    if (!is_dup) {
+                        try writer.heading(h, trimmed_text);
+                    }
+                    last_heading.clearRetainingCapacity();
+                    try last_heading.appendSlice(gpa, trimmed_text);
+                    lines_since_heading = 0;
                     continue;
                 }
-                // Heading-sized but doesn't look textual (single glyph,
-                // pure punctuation, etc.) — fall through and treat as
-                // ordinary body text.
             }
             if (trimmed_text.len == 0) {
                 try flushPara(gpa, writer, &pending_para);
@@ -115,6 +135,7 @@ pub fn convert(
                 }
             }
             try pending_para.appendSlice(gpa, trimmed_text);
+            lines_since_heading += 1;
             // TOC entries (had a dot-leader run) should not be reflowed with
             // the next line — flush immediately.
             if (line.had_dot_leader) {
@@ -362,6 +383,38 @@ fn computeMedianSize(pages: []const PageLines) f64 {
     if (collect.items.len == 0) return 0;
     std.mem.sort(f64, collect.items, {}, std.sort.asc(f64));
     return collect.items[collect.items.len / 2];
+}
+
+/// Strip leading section numbering ("１． ", "1.2.3 ") so that
+/// "使用条件" matches "２． 使用条件" in heading dedup.
+fn normalizeHeadingText(text: []const u8) []const u8 {
+    var t = std.mem.trim(u8, text, " \t\r\n");
+    var i: usize = 0;
+    while (i < t.len) {
+        const c = t[i];
+        const is_ascii_num = std.ascii.isDigit(c) or c == '.' or c == ',';
+        // Full-width digits 0-9: U+FF10..U+FF19 → EF BC 90..99
+        const is_fw_num = i + 2 < t.len and t[i] == 0xEF and t[i + 1] == 0xBC and
+            t[i + 2] >= 0x90 and t[i + 2] <= 0x99;
+        // Full-width period '．' U+FF0E → EF BC 8E
+        const is_fw_dot = i + 2 < t.len and t[i] == 0xEF and t[i + 1] == 0xBC and t[i + 2] == 0x8E;
+        if (is_ascii_num) {
+            i += 1;
+        } else if (is_fw_num or is_fw_dot) {
+            i += 3;
+        } else if (c == ' ' or c == '\t') {
+            i += 1;
+        } else break;
+    }
+    t = t[i..];
+    return std.mem.trim(u8, t, " \t");
+}
+
+test "normalizeHeadingText strips section numbers" {
+    try std.testing.expectEqualStrings("使用条件", normalizeHeadingText("使用条件"));
+    try std.testing.expectEqualStrings("使用条件", normalizeHeadingText("２． 使用条件"));
+    try std.testing.expectEqualStrings("Overview", normalizeHeadingText("1.2.3 Overview"));
+    try std.testing.expectEqualStrings("はじめに", normalizeHeadingText("1． はじめに"));
 }
 
 /// True when `text` looks like a real heading — i.e. has at least 2
