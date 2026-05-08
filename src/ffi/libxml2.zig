@@ -72,7 +72,16 @@ pub const Node = struct {
     raw: *c.struct__xmlNode,
 
     pub fn nodeType(self: Node) NodeType {
-        return @enumFromInt(@as(c_int, @intCast(self.raw.type)));
+        const raw_type: c_int = @intCast(self.raw.type);
+        return switch (raw_type) {
+            1 => .element,
+            2 => .attribute,
+            3 => .text,
+            4 => .cdata,
+            8 => .comment,
+            9, 13 => .document, // 13 = HTML document
+            else => .other,
+        };
     }
 
     pub fn name(self: Node) []const u8 {
@@ -99,6 +108,11 @@ pub const Node = struct {
     pub fn unlinkAndFree(self: Node) void {
         c.xmlUnlinkNode(self.raw);
         c.xmlFreeNode(self.raw);
+    }
+
+    /// Equality by underlying pointer.
+    pub fn eql(self: Node, other: Node) bool {
+        return self.raw == other.raw;
     }
 
     /// Allocator-owned copy of the node's text content (recursive).
