@@ -23,6 +23,7 @@ pub const image = @import("converters/image.zig");
 pub const objc = @import("ffi/objc.zig");
 pub const libxml2 = @import("ffi/libxml2.zig");
 pub const zip = @import("util/zip.zig");
+pub const config = @import("util/config.zig");
 
 pub const Format = router.Format;
 pub const Options = struct {

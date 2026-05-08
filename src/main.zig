@@ -20,7 +20,13 @@ const usage =
     \\  --no-readable     keep full document
     \\  --pdf-pages SPEC  page ranges, e.g. "1-3,5,7-9"
     \\  --ocr             run Vision text recognition on images
+    \\  --config FILE     load JSON config (overrides defaults)
     \\  -h, --help        show this help
+    \\
+    \\config files (loaded if present, JSON):
+    \\  ./.mdctlrc                      project-level
+    \\  ~/.config/mdctl/config.json     global
+    \\  CLI flags > project > global
     \\
 ;
 
@@ -30,7 +36,8 @@ const Args = struct {
     format: ?mdctl.Format = null,
     readable: ?bool = null,
     pdf_pages_spec: ?[]const u8 = null,
-    ocr: bool = false,
+    ocr: ?bool = null,
+    config_path: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
     help: bool = false,
@@ -65,6 +72,12 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             a.pdf_pages_spec = argv[i];
         } else if (std.mem.eql(u8, arg, "--ocr")) {
             a.ocr = true;
+        } else if (std.mem.eql(u8, arg, "--no-ocr")) {
+            a.ocr = false;
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingArgValue;
+            a.config_path = argv[i];
         } else if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             return error.UnknownFlag;
         } else {
@@ -102,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.verbose) mdctl.log.setLevel(.info);
     if (args.quiet) mdctl.log.setLevel(.err);
 
+    var cfg = loadConfig(gpa, init.io, init.minimal.environ, args.config_path);
+    defer cfg.deinit(gpa);
+
     const stdin_data: ?[]u8 = if (std.mem.eql(u8, args.input.?, "-"))
         try readAllStdin(gpa, init.io)
     else
@@ -124,9 +140,9 @@ pub fn main(init: std.process.Init) !void {
 
     const out = mdctl.convert(gpa, init.io, source, .{
         .format = args.format,
-        .readable = args.readable,
+        .readable = args.readable orelse cfg.readable,
         .pdf_pages = pdf_ranges,
-        .ocr = args.ocr,
+        .ocr = (args.ocr orelse cfg.ocr) orelse false,
     }) catch |e| {
         mdctl.log.err("convert failed: {s}", .{@errorName(e)});
         std.process.exit(@intFromEnum(mdctl.errors.codeFor(e)));
@@ -148,6 +164,42 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try writeStdout(init.io, out);
     }
+}
+
+fn loadConfig(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    override_path: ?[]const u8,
+) mdctl.config.Config {
+    var merged: mdctl.config.Config = .{};
+    if (override_path) |p| {
+        return readOne(gpa, io, p) catch merged;
+    }
+    if (homeConfigPath(gpa, environ)) |p| {
+        defer gpa.free(p);
+        const global = readOne(gpa, io, p) catch mdctl.config.Config{};
+        merged = mdctl.config.merge(merged, global);
+    }
+    const project = readOne(gpa, io, ".mdctlrc") catch mdctl.config.Config{};
+    return mdctl.config.merge(merged, project);
+}
+
+fn homeConfigPath(gpa: std.mem.Allocator, environ: std.process.Environ) ?[]u8 {
+    const home = environ.getPosix("HOME") orelse return null;
+    return std.fmt.allocPrint(gpa, "{s}/.config/mdctl/config.json", .{home}) catch null;
+}
+
+fn readOne(gpa: std.mem.Allocator, io: Io, path: []const u8) !mdctl.config.Config {
+    const cwd = Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch return mdctl.config.Config{};
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fr: Io.File.Reader = .init(file, io, &buf);
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try fr.interface.appendRemainingUnlimited(gpa, &list);
+    return mdctl.config.parse(gpa, list.items);
 }
 
 fn writeStdout(io: Io, bytes: []const u8) !void {

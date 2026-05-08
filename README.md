@@ -1,53 +1,110 @@
 # mdctl
 
-macOS 原生命令行工具，把各种文档（PDF / HTML / URL / Office / 图片 / 音频）转成 Markdown，对标 [microsoft/markitdown](https://github.com/microsoft/markitdown)，但仅支持 macOS、单二进制、深度复用 Apple framework。
+> macOS 原生命令行工具，把 PDF / HTML / URL / Office 文档 / 图片 / 音频转换成 Markdown。深度复用 Apple framework（PDFKit / Vision / ImageIO），单二进制，无外部模型依赖。
+
+对标 [microsoft/markitdown](https://github.com/microsoft/markitdown) — 但仅支持 macOS（Apple Silicon）。
 
 实现方案与排期见 [`docs/research.md`](docs/research.md) 与 [`docs/roadmap.md`](docs/roadmap.md)。
 
-## 状态
-
-v0.1 骨架阶段。已支持：
-
-| 格式 | 状态 |
-| --- | --- |
-| txt / md | ✅ |
-| csv | ✅ Markdown 表格 |
-| json | ✅ pretty + ```json |
-| xml | ✅ ```xml（结构化渲染待 v0.2） |
-| html | ✅ libxml2 + turndown 算法 |
-| url | ✅ std.http.Client + 自动 readability |
-| readability | ✅ `--readable` / `--no-readable` |
-| pdf | ✅ PDFKit per-page text + `--pdf-pages 1-3,5` |
-| docx | ✅ heading style + bold/italic + 表格 + 超链接文本 |
-| xlsx | ✅ 多 sheet → H2 + 表格，sharedStrings + 公式缓存值 |
-| pptx | ✅ 每张幻灯片 → H2 + bullet list |
-| 图片（PNG/JPEG） | ✅ ImageIO EXIF/GPS 表格 |
-| OCR | ✅ Vision，`--ocr`，中英日内置 |
-
-## 构建
-
-需要 Zig 0.16.0 与 macOS 14+。
+## 安装
 
 ```bash
-zig build              # debug 构建到 zig-out/bin/mdctl
+brew tap agent-rt/tap
+brew install mdctl
+```
+
+或从源码：
+
+```bash
+git clone https://github.com/agent-rt/mdctl.git
+cd mdctl
 zig build -Doptimize=ReleaseFast
-zig build test         # 单测 + golden 对比
+# 产出在 zig-out/bin/mdctl, zig-out/lib/libmdctl.dylib, zig-out/include/mdctl.h
 ```
 
-跨架构构建：
+需要 Zig 0.16.0 与 macOS 14+（Apple Silicon）。
+
+## 支持格式
+
+| 格式 | 状态 | 说明 |
+| --- | --- | --- |
+| txt / md | ✅ | 段落分块 |
+| csv | ✅ | RFC 4180 → Markdown 表格 |
+| json | ✅ | pretty + ```json 围栏 |
+| xml | ✅ | ```xml 围栏 |
+| html | ✅ | libxml2 + turndown 算法 |
+| url | ✅ | std.http.Client + 自动 readability |
+| pdf | ✅ | PDFKit per-page text + `--pdf-pages` |
+| docx | ✅ | Heading 样式、粗斜体、表格 |
+| xlsx | ✅ | sharedStrings + 多 sheet → 表格 |
+| pptx | ✅ | 多张幻灯片 → H2 + bullet |
+| png / jpeg | ✅ | ImageIO EXIF/GPS 表 |
+| OCR | ✅ | `--ocr`，Vision 内置中英日 |
+
+## 用法
 
 ```bash
-zig build -Dtarget=aarch64-macos
-zig build -Dtarget=x86_64-macos
-```
-
-## 使用
-
-```bash
-mdctl input.txt                    # stdout
+mdctl input.pdf                            # 默认 stdout
 mdctl input.csv --out output.md
-echo '{"k":1}' | mdctl - --format json
-mdctl -h
+echo '{"k":1}' | mdctl - --format json     # stdin
+mdctl https://en.wikipedia.org/wiki/...    # URL，自动正文抽取
+mdctl scan.png --ocr                        # Vision 文字识别
+mdctl big.pdf --pdf-pages 1-3,5,10-12
+mdctl --help
 ```
 
-退出码见 [`docs/research.md`](docs/research.md) §8.11。
+### 配置文件
+
+JSON 格式，按以下优先级合并：CLI > `./.mdctlrc`（项目）> `~/.config/mdctl/config.json`（全局）：
+
+```json
+{
+  "readable": true,
+  "ocr": false,
+  "user_agent": "mdctl-bot/1.0"
+}
+```
+
+也可以 `mdctl --config path/to/cfg.json` 显式指定。
+
+### C ABI
+
+链接 `libmdctl.dylib`，包含 `<mdctl.h>`：
+
+```c
+#include "mdctl.h"
+
+int main(void) {
+  char *out = NULL;
+  size_t len = 0;
+  mdctl_options_t opts = { 0 };
+  if (mdctl_convert("doc.pdf", &opts, &out, &len) == 0) {
+    fwrite(out, 1, len, stdout);
+    mdctl_free(out, len);
+  }
+}
+```
+
+```bash
+clang -I /opt/homebrew/include -L /opt/homebrew/lib -lmdctl demo.c -o demo
+```
+
+## 退出码
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1 | 参数 / 输入路径错误 |
+| 2 | 转换失败 |
+| 3 | 缺失外部依赖 |
+| 4 | macOS 权限缺失（Vision / Speech 未授权） |
+| 5 | 不支持的格式 |
+
+## 协议
+
+MIT，仅链接 Apple framework + 系统 dylib，无传染性依赖。
+
+## 路线图
+
+- v0.7+：JS 渲染（[Lightpanda](https://lightpanda.io) 子进程）、QuickJS 用户脚本、本地音频 ASR（Speech.framework）、EPUB、ipynb、MSG 等长尾格式
+- PDF 打磨（标题识别 / 扫描件 OCR 回退 / 软换行重排 / 页眉页脚去重）见 `docs/roadmap.md`
