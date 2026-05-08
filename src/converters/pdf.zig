@@ -80,6 +80,7 @@ pub fn convert(
 
     const median = computeMedianSize(pages.items);
     markRepeatedHeaderFooter(pages.items);
+    markRecurringHeadings(pages.items, median);
 
     var pending_para: std.ArrayList(u8) = .empty;
     defer pending_para.deinit(gpa);
@@ -460,6 +461,74 @@ fn headingLevel(size: f64, median: f64) ?u8 {
 ///   N GLORY OPOS つり銭機コントロールソフト
 ///   アプリケーション開発ガイド
 /// get fully stripped, not just the deepest line.
+/// Drop running-head copies of headings that recur on >= 4 different pages.
+/// Real chapter titles appear once and are preserved. The first occurrence
+/// (the actual chapter heading) is kept; subsequent copies (the running
+/// head printed at the top of every page within that chapter) are skipped.
+fn markRecurringHeadings(pages: []PageLines, median: f64) void {
+    if (pages.len < 3) return;
+    const min_count: usize = 4;
+
+    const Entry = struct {
+        norm: []const u8,
+        count: usize,
+        first_page: usize,
+        first_line: usize,
+    };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(std.heap.page_allocator);
+
+    // First pass: count heading occurrences across pages.
+    for (pages, 0..) |p, page_idx| {
+        for (p.lines.items, 0..) |line, line_idx| {
+            if (line.skipped) continue;
+            if (headingLevel(line.size, median) == null) continue;
+            const trimmed = std.mem.trim(u8, line.text, " \t\r\n");
+            if (!looksLikeHeading(trimmed)) continue;
+            const norm = normalizeHeadingText(trimmed);
+            if (norm.len == 0) continue;
+
+            var found = false;
+            for (entries.items) |*e| {
+                if (std.mem.eql(u8, e.norm, norm)) {
+                    e.count += 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                entries.append(std.heap.page_allocator, .{
+                    .norm = norm,
+                    .count = 1,
+                    .first_page = page_idx,
+                    .first_line = line_idx,
+                }) catch return;
+            }
+        }
+    }
+
+    // Second pass: for any heading recurring >= min_count, skip every copy
+    // EXCEPT the first occurrence.
+    for (pages, 0..) |*p, page_idx| {
+        for (p.lines.items, 0..) |*line, line_idx| {
+            if (line.skipped) continue;
+            if (headingLevel(line.size, median) == null) continue;
+            const trimmed = std.mem.trim(u8, line.text, " \t\r\n");
+            if (!looksLikeHeading(trimmed)) continue;
+            const norm = normalizeHeadingText(trimmed);
+            if (norm.len == 0) continue;
+
+            for (entries.items) |e| {
+                if (!std.mem.eql(u8, e.norm, norm)) continue;
+                if (e.count < min_count) break;
+                if (page_idx == e.first_page and line_idx == e.first_line) break;
+                line.skipped = true;
+                break;
+            }
+        }
+    }
+}
+
 fn markRepeatedHeaderFooter(pages: []PageLines) void {
     if (pages.len < 3) return;
     const threshold = (pages.len * 7) / 10; // ≥70% of pages
@@ -467,8 +536,6 @@ fn markRepeatedHeaderFooter(pages: []PageLines) void {
 
     var iter: usize = 0;
     while (iter < max_iters) : (iter += 1) {
-        // Drop standalone page-number lines first — their normalised form
-        // is empty so the cross-match pass below can't see them.
         var page_num_marked = false;
         for (pages) |*p| {
             if (markPageNumberAtEdge(p, .first)) page_num_marked = true;
