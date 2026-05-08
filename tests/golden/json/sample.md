@@ -1,0 +1,13 @@
+```json
+{
+  "name": "alice",
+  "tags": [
+    1,
+    2,
+    3
+  ],
+  "nested": {
+    "k": true
+  }
+}
+```

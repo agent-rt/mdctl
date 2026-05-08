@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-macos
+          - runner: macos-14
+            target: x86_64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: zig version
+        run: zig version
+
+      - name: build
+        run: zig build -Dtarget=${{ matrix.target }} --summary all
+
+      # Tests run on the host arch only; cross-compiled x86_64 binary won't
+      # execute on arm64 runner without rosetta. Native test job covers
+      # behavior.
+      - name: test
+        if: matrix.target == 'aarch64-macos'
+        run: zig build test --summary all

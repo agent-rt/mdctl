@@ -1,0 +1,13 @@
+.{
+    .name = .mdctl,
+    .version = "0.1.0",
+    .fingerprint = 0x5602c04db910c5f0,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

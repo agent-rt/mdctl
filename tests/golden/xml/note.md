@@ -1,0 +1,4 @@
+```xml
+<?xml version="1.0"?>
+<note><to>You</to><body>hi</body></note>
+```
