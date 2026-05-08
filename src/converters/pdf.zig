@@ -81,7 +81,6 @@ pub fn convert(
     const median = computeMedianSize(pages.items);
     markRepeatedHeaderFooter(pages.items);
 
-    var prev_kind: LineKind = .blank;
     var pending_para: std.ArrayList(u8) = .empty;
     defer pending_para.deinit(gpa);
 
@@ -92,27 +91,30 @@ pub fn convert(
             if (lvl) |h| {
                 try flushPara(gpa, writer, &pending_para);
                 try writer.heading(h, std.mem.trim(u8, line.text, " \t\r\n"));
-                prev_kind = .heading;
                 continue;
             }
             const trimmed = std.mem.trim(u8, line.text, " \t\r\n");
             if (trimmed.len == 0) {
                 try flushPara(gpa, writer, &pending_para);
-                prev_kind = .blank;
                 continue;
             }
-            // Soft-wrap reflow: append to pending paragraph unless caller
-            // signalled a hard break (already-emitted heading or blank line).
             if (pending_para.items.len > 0) {
                 const last = pending_para.items[pending_para.items.len - 1];
-                if (shouldBreak(last, trimmed[0])) {
+                if (!line.starts_physical_line) {
+                    // Same physical line, only a font-size split — join
+                    // directly with no separator.
+                } else if (shouldBreak(last, trimmed[0])) {
                     try flushPara(gpa, writer, &pending_para);
                 } else if (!isCjkBoundary(last, trimmed[0])) {
                     try pending_para.append(gpa, ' ');
                 }
             }
             try pending_para.appendSlice(gpa, trimmed);
-            prev_kind = .text;
+            // TOC entries (had a dot-leader run) should not be reflowed with
+            // the next line — flush immediately.
+            if (line.had_dot_leader) {
+                try flushPara(gpa, writer, &pending_para);
+            }
         }
     }
     try flushPara(gpa, writer, &pending_para);
@@ -127,6 +129,12 @@ const Line = struct {
     text: []u8, // owned
     size: f64, // representative font size (max within line)
     skipped: bool = false, // true after header/footer dedup
+    /// true → preceded by a \n in the source (start of a new physical line).
+    /// false → split off a previous segment by a font-size change only.
+    starts_physical_line: bool = true,
+    /// true → original line ended with a dot-leader run (TOC entry).
+    /// Caller forces a paragraph break after this line.
+    had_dot_leader: bool = false,
 };
 
 const PageLines = struct {
@@ -170,22 +178,77 @@ fn collectPageLines(gpa: std.mem.Allocator, page: pdfkit.Page) !PageLines {
     var page_lines: PageLines = .{};
     errdefer page_lines.deinit(gpa);
 
+    // Split the page text into Lines on two boundaries:
+    //   1. '\n' — a physical line break in the PDF
+    //   2. a meaningful font-size change within a physical line — splits a
+    //      run-on heading+body line like "はじめに このたびは…" into two
+    //      logical Lines so heading detection doesn't promote the body.
+    // Each physical line is post-processed: trailing dot-leader is stripped
+    // and the `had_dot_leader` flag is recorded for reflow logic.
     var line_start: usize = 0;
     var i: usize = 0;
     while (i <= buf.items.len) : (i += 1) {
         const at_end = i == buf.items.len;
         const is_nl = !at_end and buf.items[i] == '\n';
         if (!is_nl and !at_end) continue;
-        const slice = buf.items[line_start..i];
-        const cleaned = stripDotLeader(slice);
-        if (cleaned.len > 0) {
-            const text = try gpa.dupe(u8, cleaned);
-            const max = maxSize(sizes.items[line_start..i]);
-            try page_lines.lines.append(gpa, .{ .text = text, .size = max });
+
+        const physical_slice = buf.items[line_start..i];
+        const trimmed_full = std.mem.trim(u8, physical_slice, " \t\r\n");
+        const lead_trim: usize = @intFromPtr(trimmed_full.ptr) - @intFromPtr(physical_slice.ptr);
+        const stripped = stripDotLeader(trimmed_full);
+        const had_leader = stripped.len < trimmed_full.len;
+
+        if (stripped.len > 0) {
+            const sizes_slice = sizes.items[line_start + lead_trim ..];
+            try emitLineWithFontSplits(
+                gpa,
+                &page_lines,
+                stripped,
+                sizes_slice[0..@min(stripped.len, sizes_slice.len)],
+                had_leader,
+            );
         }
         line_start = i + 1;
     }
     return page_lines;
+}
+
+/// Split `text` into multiple Line records wherever the font size changes.
+/// `sizes` is the parallel size array for `text`. The caller passes the
+/// post-strip text; sizes still has the pre-strip layout but we only read
+/// up to `text.len`, which is the leading prefix preserved by stripping.
+fn emitLineWithFontSplits(
+    gpa: std.mem.Allocator,
+    page_lines: *PageLines,
+    text: []const u8,
+    sizes: []const f64,
+    had_leader: bool,
+) !void {
+    if (text.len == 0) return;
+    const epsilon: f64 = 0.5;
+
+    var seg_start: usize = 0;
+    var first_segment = true;
+    var i: usize = 1;
+    while (i <= text.len) : (i += 1) {
+        const at_end = i == text.len;
+        const size_change = !at_end and i < sizes.len and i - 1 < sizes.len and
+            @abs(sizes[i] - sizes[i - 1]) > epsilon;
+        if (!size_change and !at_end) continue;
+
+        const seg = std.mem.trim(u8, text[seg_start..i], " \t\r\n");
+        if (seg.len > 0) {
+            const max = maxSize(sizes[seg_start..@min(i, sizes.len)]);
+            try page_lines.lines.append(gpa, .{
+                .text = try gpa.dupe(u8, seg),
+                .size = max,
+                .starts_physical_line = first_segment,
+                .had_dot_leader = at_end and had_leader,
+            });
+            first_segment = false;
+        }
+        seg_start = i;
+    }
 }
 
 /// Strip trailing runs of dot-leader characters (commonly seen in PDF
