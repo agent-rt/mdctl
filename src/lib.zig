@@ -35,6 +35,8 @@ pub const Options = struct {
     readable: ?bool = null,
     /// PDF: optional page ranges (1-based). Empty means all pages.
     pdf_pages: []const pdf.Range = &.{},
+    /// PDF: emit bookmark outline as a Markdown TOC at top. Default on.
+    pdf_toc: bool = true,
     /// Images: enable Vision text recognition.
     ocr: bool = false,
 };
@@ -80,6 +82,7 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .pdf => try pdf.convert(gpa, &writer, data, .{
             .pages = opts.pdf_pages,
             .ocr_scanned = opts.ocr,
+            .toc = opts.pdf_toc,
         }),
         .docx => try docx.convert(gpa, &writer, data),
         .xlsx => try xlsx.convert(gpa, &writer, data),

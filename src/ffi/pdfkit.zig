@@ -60,6 +60,36 @@ pub const Document = struct {
         if (p == null) return null;
         return .{ .raw = p };
     }
+
+    /// Top-level outline (bookmark tree) entry, or null if the document has
+    /// none. The returned outline owns its subtree.
+    pub fn outlineRoot(self: Document) ?Outline {
+        const o = objc.send0(objc.Id, self.raw, "outlineRoot");
+        if (o == null) return null;
+        return .{ .raw = o };
+    }
+};
+
+pub const Outline = struct {
+    raw: objc.Id,
+
+    pub fn childCount(self: Outline) usize {
+        return objc.send0(usize, self.raw, "numberOfChildren");
+    }
+
+    pub fn child(self: Outline, index: usize) ?Outline {
+        const c = objc.send1(objc.Id, self.raw, "childAtIndex:", index);
+        if (c == null) return null;
+        return .{ .raw = c };
+    }
+
+    /// Allocator-owned UTF-8 label, or empty when this entry is the document
+    /// root (which has no label).
+    pub fn label(self: Outline, gpa: std.mem.Allocator) ![]u8 {
+        const ns = objc.send0(objc.Id, self.raw, "label");
+        if (ns == null) return gpa.dupe(u8, "");
+        return nsStringToUtf8(gpa, ns);
+    }
 };
 
 pub const Page = struct {

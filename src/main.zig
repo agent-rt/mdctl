@@ -19,6 +19,7 @@ const usage =
     \\  --readable        strip nav/sidebar/script noise (default on for URLs)
     \\  --no-readable     keep full document
     \\  --pdf-pages SPEC  page ranges, e.g. "1-3,5,7-9"
+    \\  --no-toc          do not emit PDF bookmark outline as TOC
     \\  --ocr             run Vision text recognition on images
     \\  --config FILE     load JSON config (overrides defaults)
     \\  -h, --help        show this help
@@ -36,6 +37,7 @@ const Args = struct {
     format: ?mdctl.Format = null,
     readable: ?bool = null,
     pdf_pages_spec: ?[]const u8 = null,
+    pdf_toc: bool = true,
     ocr: ?bool = null,
     config_path: ?[]const u8 = null,
     verbose: bool = false,
@@ -70,6 +72,8 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingArgValue;
             a.pdf_pages_spec = argv[i];
+        } else if (std.mem.eql(u8, arg, "--no-toc")) {
+            a.pdf_toc = false;
         } else if (std.mem.eql(u8, arg, "--ocr")) {
             a.ocr = true;
         } else if (std.mem.eql(u8, arg, "--no-ocr")) {
@@ -144,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
         .format = args.format,
         .readable = args.readable orelse cfg.readable,
         .pdf_pages = pdf_ranges,
+        .pdf_toc = args.pdf_toc,
         .ocr = (args.ocr orelse cfg.ocr) orelse false,
     }) catch |e| {
         mdctl.log.err("convert failed: {s}", .{@errorName(e)});

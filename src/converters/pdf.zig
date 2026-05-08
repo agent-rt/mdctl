@@ -30,6 +30,9 @@ pub const ConvertOptions = struct {
     /// Run Vision OCR on pages whose extracted text is below
     /// `scanned_threshold`. Off by default — opt-in via --ocr.
     ocr_scanned: bool = false,
+    /// Emit the PDF's bookmark outline as a Markdown TOC at the very top.
+    /// On by default; turn off via --no-toc.
+    toc: bool = true,
 };
 
 pub fn convert(
@@ -51,6 +54,8 @@ pub fn convert(
         try writer.finish();
         return;
     }
+
+    if (opts.toc) try emitOutlineToc(gpa, writer, doc);
 
     var pages: std.ArrayList(PageLines) = .empty;
     defer {
@@ -442,6 +447,43 @@ fn totalTextLen(p: *const PageLines) usize {
         n += std.mem.trim(u8, line.text, " \t\r\n").len;
     }
     return n;
+}
+
+fn emitOutlineToc(gpa: std.mem.Allocator, writer: *md.MdWriter, doc: pdfkit.Document) !void {
+    const root = doc.outlineRoot() orelse return;
+    if (root.childCount() == 0) return;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "## Contents\n\n");
+    try walkOutline(gpa, &buf, root, 0);
+    if (buf.items.len <= "## Contents\n\n".len) return; // empty outline
+
+    try writer.rawBlock(std.mem.trimEnd(u8, buf.items, " \t\r\n"));
+}
+
+fn walkOutline(
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    node: pdfkit.Outline,
+    depth: usize,
+) !void {
+    const count = node.childCount();
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const child = node.child(i) orelse continue;
+        const label = try child.label(gpa);
+        defer gpa.free(label);
+        const trimmed = std.mem.trim(u8, label, " \t\r\n");
+        if (trimmed.len > 0) {
+            var d: usize = 0;
+            while (d < depth) : (d += 1) try buf.appendSlice(gpa, "  ");
+            try buf.appendSlice(gpa, "* ");
+            try buf.appendSlice(gpa, trimmed);
+            try buf.append(gpa, '\n');
+        }
+        try walkOutline(gpa, buf, child, depth + 1);
+    }
 }
 
 fn ocrPageInto(gpa: std.mem.Allocator, page: pdfkit.Page, out: *PageLines) !void {
