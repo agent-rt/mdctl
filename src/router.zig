@@ -13,6 +13,7 @@ pub const Format = enum {
     docx,
     xlsx,
     pptx,
+    epub,
     jpeg,
     png,
     unknown,
@@ -33,6 +34,7 @@ pub fn fromExtension(path: []const u8) Format {
         .{ .ext = ".docx", .fmt = .docx },
         .{ .ext = ".xlsx", .fmt = .xlsx },
         .{ .ext = ".pptx", .fmt = .pptx },
+        .{ .ext = ".epub", .fmt = .epub },
         .{ .ext = ".jpg", .fmt = .jpeg },
         .{ .ext = ".jpeg", .fmt = .jpeg },
         .{ .ext = ".png", .fmt = .png },
@@ -59,10 +61,13 @@ pub fn fromMagic(bytes: []const u8) Format {
 /// ZIP central directory. We don't open the archive — just scan raw bytes for
 /// the unique part names. Cheap and reliable for OOXML.
 fn ooxmlKind(bytes: []const u8) Format {
+    // EPUB has 'application/epub+zip' as the first stored 'mimetype' entry.
+    if (std.mem.indexOf(u8, bytes, "application/epub+zip") != null) return .epub;
+    if (std.mem.indexOf(u8, bytes, "META-INF/container.xml") != null) return .epub;
     if (std.mem.indexOf(u8, bytes, "word/document.xml") != null) return .docx;
     if (std.mem.indexOf(u8, bytes, "xl/workbook.xml") != null) return .xlsx;
     if (std.mem.indexOf(u8, bytes, "ppt/presentation.xml") != null) return .pptx;
-    return .docx; // default OOXML to docx; users can override via --format
+    return .docx;
 }
 
 pub fn detect(path: []const u8, bytes: []const u8) Format {

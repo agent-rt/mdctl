@@ -75,6 +75,12 @@ const cases = [_]Case{
         .input = @embedFile("fixtures/image/blank.png"),
         .expected = @embedFile("golden/image/blank.md"),
     },
+    .{
+        .name = "epub/sample",
+        .format = .epub,
+        .input = @embedFile("fixtures/epub/sample.epub"),
+        .expected = @embedFile("golden/epub/sample.md"),
+    },
 };
 
 test "zip extract" {

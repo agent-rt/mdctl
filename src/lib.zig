@@ -18,6 +18,7 @@ pub const pdf = @import("converters/pdf.zig");
 pub const docx = @import("converters/docx.zig");
 pub const xlsx = @import("converters/xlsx.zig");
 pub const pptx = @import("converters/pptx.zig");
+pub const epub = @import("converters/epub.zig");
 pub const image = @import("converters/image.zig");
 
 pub const objc = @import("ffi/objc.zig");
@@ -87,6 +88,7 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .docx => try docx.convert(gpa, &writer, data),
         .xlsx => try xlsx.convert(gpa, &writer, data),
         .pptx => try pptx.convert(gpa, &writer, data),
+        .epub => try epub.convert(gpa, &writer, data),
         .jpeg, .png => try image.convert(gpa, &writer, data, .{
             .path_for_link = path_hint,
             .ocr = opts.ocr,

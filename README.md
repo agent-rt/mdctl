@@ -39,6 +39,7 @@ zig build -Doptimize=ReleaseFast
 | xlsx | ✅ | sharedStrings + 多 sheet → 表格 |
 | pptx | ✅ | 多张幻灯片 → H2 + bullet |
 | png / jpeg | ✅ | ImageIO EXIF/GPS 表 |
+| epub | ✅ | OPF spine + 各章 XHTML 复用 html 转换器 |
 | OCR | ✅ | `--ocr`，Vision 内置中英日 |
 
 ## 用法
