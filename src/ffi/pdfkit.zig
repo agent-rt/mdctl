@@ -71,7 +71,49 @@ pub const Page = struct {
         if (ns == null) return gpa.dupe(u8, "");
         return nsStringToUtf8(gpa, ns);
     }
+
+    /// Walk the page's attributedString; for each run of identical font size
+    /// the callback receives (utf16_offset, utf16_length, font_size).
+    pub fn forEachFontRun(
+        self: Page,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), usize, usize, f64) anyerror!void,
+    ) !void {
+        const attr = objc.send0(objc.Id, self.raw, "attributedString");
+        if (attr == null) return;
+        const total = objc.send0(usize, attr, "length");
+        const font_key = objc.nsString("NSFont");
+
+        var i: usize = 0;
+        while (i < total) {
+            var range: NSRange = .{ .location = 0, .length = 0 };
+            const font = objc.send3(
+                objc.Id,
+                attr,
+                "attribute:atIndex:effectiveRange:",
+                font_key,
+                i,
+                &range,
+            );
+            if (range.length == 0) break;
+            const size: f64 = if (font != null) objc.send0(f64, font, "pointSize") else 0;
+            try callback(ctx, range.location, range.length, size);
+            i = range.location + range.length;
+        }
+    }
+
+    /// Substring of the page's plain string by UTF-16 range, returned as UTF-8.
+    pub fn substring(self: Page, gpa: std.mem.Allocator, utf16_off: usize, utf16_len: usize) ![]u8 {
+        const ns = objc.send0(objc.Id, self.raw, "string");
+        if (ns == null) return gpa.dupe(u8, "");
+        const range: NSRange = .{ .location = utf16_off, .length = utf16_len };
+        const sub = objc.send1(objc.Id, ns, "substringWithRange:", range);
+        if (sub == null) return gpa.dupe(u8, "");
+        return nsStringToUtf8(gpa, sub);
+    }
 };
+
+pub const NSRange = extern struct { location: usize, length: usize };
 
 fn nsStringToUtf8(gpa: std.mem.Allocator, ns_string: objc.Id) ![]u8 {
     const cstr = objc.send0([*c]const u8, ns_string, "UTF8String");
