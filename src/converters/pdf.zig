@@ -124,6 +124,20 @@ pub fn convert(
                 try flushPara(gpa, writer, &pending_para);
                 continue;
             }
+
+            // Bullet item: flush whatever's pending, then start a new item
+            // with a Markdown bullet marker and the post-bullet text.
+            if (line.starts_physical_line) {
+                if (stripBulletPrefix(trimmed_text)) |rest| {
+                    try flushPara(gpa, writer, &pending_para);
+                    try pending_para.appendSlice(gpa, "* ");
+                    try pending_para.appendSlice(gpa, rest);
+                    lines_since_heading += 1;
+                    if (line.had_dot_leader) try flushPara(gpa, writer, &pending_para);
+                    continue;
+                }
+            }
+
             if (pending_para.items.len > 0) {
                 const last = pending_para.items[pending_para.items.len - 1];
                 if (!line.starts_physical_line) {
@@ -774,6 +788,43 @@ fn isBulletStart(c: u8) bool {
     };
 }
 
+/// If `text` starts with a bullet glyph (ASCII or common CJK/document
+/// bullets), returns the remainder of the text with leading whitespace
+/// stripped. Otherwise returns null.
+fn stripBulletPrefix(text: []const u8) ?[]const u8 {
+    // Multi-byte UTF-8 bullets:
+    //   • U+2022 BULLET                     E2 80 A2
+    //   ‣ U+2023 TRIANGULAR BULLET          E2 80 A3
+    //   ◦ U+25E6 WHITE BULLET               E2 97 A6
+    //   ▪ U+25AA BLACK SMALL SQUARE         E2 96 AA
+    //   ▫ U+25AB WHITE SMALL SQUARE         E2 96 AB
+    //   ● U+25CF BLACK CIRCLE               E2 97 8F
+    //   ○ U+25CB WHITE CIRCLE               E2 97 8B
+    //   ◆ U+25C6 BLACK DIAMOND              E2 97 86
+    //   ◇ U+25C7 WHITE DIAMOND              E2 97 87
+    //   ・ U+30FB KATAKANA MIDDLE DOT       E3 83 BB
+    //   ※ U+203B REFERENCE MARK             E2 80 BB
+    const utf8_bullets = [_][]const u8{
+        "\xE2\x80\xA2", "\xE2\x80\xA3", "\xE2\x97\xA6",
+        "\xE2\x96\xAA", "\xE2\x96\xAB", "\xE2\x97\x8F",
+        "\xE2\x97\x8B", "\xE2\x97\x86", "\xE2\x97\x87",
+        "\xE3\x83\xBB", "\xE2\x80\xBB",
+    };
+    for (utf8_bullets) |b| {
+        if (std.mem.startsWith(u8, text, b)) {
+            return std.mem.trimStart(u8, text[b.len..], " \t");
+        }
+    }
+    return null;
+}
+
+test "stripBulletPrefix recognises bullets" {
+    try std.testing.expectEqualStrings("item", stripBulletPrefix("• item").?);
+    try std.testing.expectEqualStrings("item", stripBulletPrefix("• \titem").?);
+    try std.testing.expectEqualStrings("项目", stripBulletPrefix("◆ 项目").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), stripBulletPrefix("normal text"));
+}
+
 /// CJK characters are >= 0x80 in UTF-8 leading byte. If both sides are
 /// non-ASCII, assume CJK and skip the joining space.
 fn isCjkBoundary(prev_last: u8, next_first: u8) bool {
@@ -783,7 +834,14 @@ fn isCjkBoundary(prev_last: u8, next_first: u8) bool {
 fn flushPara(gpa: std.mem.Allocator, writer: *md.MdWriter, buf: *std.ArrayList(u8)) !void {
     if (buf.items.len == 0) return;
     const trimmed = std.mem.trim(u8, buf.items, " \t\r\n");
-    if (trimmed.len > 0) try writer.paragraph(trimmed);
+    if (trimmed.len > 0) {
+        // Markdown list items: emit raw so the leading '*' isn't escaped.
+        if (std.mem.startsWith(u8, trimmed, "* ")) {
+            try writer.rawBlock(trimmed);
+        } else {
+            try writer.paragraph(trimmed);
+        }
+    }
     _ = gpa;
     buf.clearRetainingCapacity();
 }
