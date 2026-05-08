@@ -37,6 +37,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     if (target.result.os.tag == .macos) configureMacosModule(b, dylib.root_module);
+    // Homebrew rewrites the dylib install_name to its prefix path; reserve
+    // header pad so the rewrite doesn't overflow the Mach-O header.
+    dylib.headerpad_max_install_names = true;
     b.installArtifact(dylib);
     b.installFile("include/mdctl.h", "include/mdctl.h");
 
