@@ -87,14 +87,19 @@ pub fn convert(
     for (pages.items) |page_data| {
         for (page_data.lines.items) |line| {
             if (line.skipped) continue;
-            const lvl = headingLevel(line.size, median);
-            if (lvl) |h| {
-                try flushPara(gpa, writer, &pending_para);
-                try writer.heading(h, std.mem.trim(u8, line.text, " \t\r\n"));
-                continue;
+            const trimmed_text = std.mem.trim(u8, line.text, " \t\r\n");
+            const lvl_opt = headingLevel(line.size, median);
+            if (lvl_opt) |h| {
+                if (looksLikeHeading(trimmed_text)) {
+                    try flushPara(gpa, writer, &pending_para);
+                    try writer.heading(h, trimmed_text);
+                    continue;
+                }
+                // Heading-sized but doesn't look textual (single glyph,
+                // pure punctuation, etc.) — fall through and treat as
+                // ordinary body text.
             }
-            const trimmed = std.mem.trim(u8, line.text, " \t\r\n");
-            if (trimmed.len == 0) {
+            if (trimmed_text.len == 0) {
                 try flushPara(gpa, writer, &pending_para);
                 continue;
             }
@@ -103,13 +108,13 @@ pub fn convert(
                 if (!line.starts_physical_line) {
                     // Same physical line, only a font-size split — join
                     // directly with no separator.
-                } else if (shouldBreak(last, trimmed[0])) {
+                } else if (shouldBreak(last, trimmed_text[0])) {
                     try flushPara(gpa, writer, &pending_para);
-                } else if (!isCjkBoundary(last, trimmed[0])) {
+                } else if (!isCjkBoundary(last, trimmed_text[0])) {
                     try pending_para.append(gpa, ' ');
                 }
             }
-            try pending_para.appendSlice(gpa, trimmed);
+            try pending_para.appendSlice(gpa, trimmed_text);
             // TOC entries (had a dot-leader run) should not be reflowed with
             // the next line — flush immediately.
             if (line.had_dot_leader) {
@@ -359,6 +364,30 @@ fn computeMedianSize(pages: []const PageLines) f64 {
     return collect.items[collect.items.len / 2];
 }
 
+/// True when `text` looks like a real heading — i.e. has at least 2
+/// non-punctuation characters. Filters out things like "# ☞" callouts
+/// where a single decorative glyph is rendered at heading size.
+fn looksLikeHeading(text: []const u8) bool {
+    var letters: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c < 0x80) {
+            // ASCII: alnum counts.
+            if (std.ascii.isAlphanumeric(c)) letters += 1;
+            i += 1;
+        } else {
+            // Multi-byte UTF-8: count any non-ASCII codepoint as a letter
+            // (covers CJK, full-width digits, etc).
+            const seq = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            letters += 1;
+            i += seq;
+        }
+        if (letters >= 2) return true;
+    }
+    return false;
+}
+
 fn headingLevel(size: f64, median: f64) ?u8 {
     if (median <= 0 or size <= 0) return null;
     const ratio = size / median;
@@ -373,27 +402,59 @@ fn headingLevel(size: f64, median: f64) ?u8 {
 // ============================================================================
 
 /// Mark first/last text lines of each page as skipped if they appear in a
-/// majority of pages — typical running heads, page numbers.
+/// majority of pages — typical running heads, page numbers, brand strings.
+/// Walks up to `max_depth` lines from each edge so multi-line footers like
+///   N GLORY OPOS つり銭機コントロールソフト
+///   アプリケーション開発ガイド
+/// get fully stripped, not just the deepest line.
 fn markRepeatedHeaderFooter(pages: []PageLines) void {
     if (pages.len < 3) return;
-
     const threshold = (pages.len * 7) / 10; // ≥70% of pages
-    markEdge(pages, .first, threshold);
-    markEdge(pages, .last, threshold);
+    const max_iters: usize = 4;
+
+    var iter: usize = 0;
+    while (iter < max_iters) : (iter += 1) {
+        // Drop standalone page-number lines first — their normalised form
+        // is empty so the cross-match pass below can't see them.
+        var page_num_marked = false;
+        for (pages) |*p| {
+            if (markPageNumberAtEdge(p, .first)) page_num_marked = true;
+            if (markPageNumberAtEdge(p, .last)) page_num_marked = true;
+        }
+        const f = markEdgeAtDepth(pages, .first, 0, threshold);
+        const l = markEdgeAtDepth(pages, .last, 0, threshold);
+        if (!f and !l and !page_num_marked) break;
+    }
+}
+
+/// Drop a standalone page-number line (only digits / whitespace / a few
+/// separators) at the given edge. Returns true if a line was marked.
+fn markPageNumberAtEdge(p: *PageLines, edge: Edge) bool {
+    const idx = edgeIndexAtDepth(p, edge, 0) orelse return false;
+    const t = std.mem.trim(u8, p.lines.items[idx].text, " \t\r\n");
+    if (t.len == 0 or t.len > 12) return false;
+    for (t) |c| {
+        const ok = std.ascii.isDigit(c) or c == ' ' or c == '/' or c == '-' or c == '|' or c == '.';
+        if (!ok) return false;
+    }
+    p.lines.items[idx].skipped = true;
+    return true;
 }
 
 const Edge = enum { first, last };
 
-fn markEdge(pages: []PageLines, edge: Edge, threshold: usize) void {
-    // Naive O(N^2) on edge lines — N = page count, fine for typical docs.
+/// At the given `depth` (0 = innermost, 1 = next, ...) on each page, gather
+/// the first/last non-skipped non-empty text line. Count normalized matches;
+/// mark all matches `skipped` if any group reaches the threshold. Returns
+/// true if any line was marked (so the outer loop knows to keep going).
+fn markEdgeAtDepth(pages: []PageLines, edge: Edge, depth: usize, threshold: usize) bool {
     var counts: std.ArrayList(usize) = .empty;
     defer counts.deinit(std.heap.page_allocator);
-
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(std.heap.page_allocator);
 
     for (pages) |*p| {
-        const line_idx = edgeIndex(p, edge) orelse continue;
+        const line_idx = edgeIndexAtDepth(p, edge, depth) orelse continue;
         const norm = normalizeForCmp(p.lines.items[line_idx].text);
         if (norm.len == 0) continue;
         var found = false;
@@ -405,55 +466,77 @@ fn markEdge(pages: []PageLines, edge: Edge, threshold: usize) void {
             }
         }
         if (!found) {
-            keys.append(std.heap.page_allocator, norm) catch return;
-            counts.append(std.heap.page_allocator, 1) catch return;
+            keys.append(std.heap.page_allocator, norm) catch return false;
+            counts.append(std.heap.page_allocator, 1) catch return false;
         }
     }
 
+    var any_marked = false;
     for (pages) |*p| {
-        const line_idx = edgeIndex(p, edge) orelse continue;
+        const line_idx = edgeIndexAtDepth(p, edge, depth) orelse continue;
         const norm = normalizeForCmp(p.lines.items[line_idx].text);
         if (norm.len == 0) continue;
         for (keys.items, 0..) |k, i| {
             if (std.mem.eql(u8, k, norm) and counts.items[i] >= threshold) {
                 p.lines.items[line_idx].skipped = true;
+                any_marked = true;
                 break;
             }
         }
     }
+    return any_marked;
 }
 
-fn edgeIndex(p: *PageLines, edge: Edge) ?usize {
+/// Returns the index of the (depth+1)-th non-skipped non-empty text line
+/// counted from the given edge. depth=0 means innermost (very first/last).
+fn edgeIndexAtDepth(p: *PageLines, edge: Edge, depth: usize) ?usize {
+    var seen: usize = 0;
     switch (edge) {
         .first => {
             for (p.lines.items, 0..) |line, i| {
-                if (std.mem.trim(u8, line.text, " \t\r\n").len > 0) return i;
+                if (line.skipped) continue;
+                if (std.mem.trim(u8, line.text, " \t\r\n").len == 0) continue;
+                if (seen == depth) return i;
+                seen += 1;
             }
         },
         .last => {
             var i: usize = p.lines.items.len;
             while (i > 0) {
                 i -= 1;
-                if (std.mem.trim(u8, p.lines.items[i].text, " \t\r\n").len > 0) return i;
+                const line = p.lines.items[i];
+                if (line.skipped) continue;
+                if (std.mem.trim(u8, line.text, " \t\r\n").len == 0) continue;
+                if (seen == depth) return i;
+                seen += 1;
             }
         },
     }
     return null;
 }
 
-/// Normalise edge-line text so "Page 12" vs "Page 13" can compare equal.
-/// Returns a sub-slice of `text` (no allocation): digits collapsed to '#'
-/// would require alloc; instead just trim trailing digits & whitespace.
+/// Normalise edge-line text so running heads with varying page numbers
+/// compare equal. Strips runs of digits + simple separators from BOTH ends:
+///   "Page 12"                   -> "Page"
+///   "12 / 47 ©"                 -> "©"
+///   "2 GLORY OPOS ..."          -> "GLORY OPOS ..."
 fn normalizeForCmp(text: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    var start: usize = 0;
     var end = trimmed.len;
-    while (end > 0) {
+    while (end > start) {
         const c = trimmed[end - 1];
-        if (std.ascii.isDigit(c) or c == ' ' or c == '/' or c == '-' or c == '|') {
+        if (std.ascii.isDigit(c) or c == ' ' or c == '/' or c == '-' or c == '|' or c == '.') {
             end -= 1;
         } else break;
     }
-    return std.mem.trim(u8, trimmed[0..end], " \t");
+    while (start < end) {
+        const c = trimmed[start];
+        if (std.ascii.isDigit(c) or c == ' ' or c == '/' or c == '-' or c == '|' or c == '.') {
+            start += 1;
+        } else break;
+    }
+    return std.mem.trim(u8, trimmed[start..end], " \t");
 }
 
 // ============================================================================
@@ -560,4 +643,17 @@ test "should break" {
 test "normalize for cmp trims trailing digits" {
     try std.testing.expectEqualStrings("Page", normalizeForCmp("  Page 12  "));
     try std.testing.expectEqualStrings("Chapter A", normalizeForCmp("Chapter A - 5"));
+}
+
+test "normalize for cmp trims leading digits" {
+    try std.testing.expectEqualStrings("GLORY OPOS", normalizeForCmp("2 GLORY OPOS"));
+    try std.testing.expectEqualStrings("Section", normalizeForCmp("12.3 Section"));
+}
+
+test "looksLikeHeading filters single glyph" {
+    try std.testing.expect(!looksLikeHeading("☞"));
+    try std.testing.expect(!looksLikeHeading(" *"));
+    try std.testing.expect(looksLikeHeading("Hi"));
+    try std.testing.expect(looksLikeHeading("はじめに"));
+    try std.testing.expect(looksLikeHeading("１． 概要"));
 }
