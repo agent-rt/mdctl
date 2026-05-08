@@ -45,7 +45,7 @@ jobs:
       - name: Build release
         run: |
           zig build -Doptimize=ReleaseSafe
-          ls -la zig-out/bin zig-out/lib zig-out/include
+          ls -la zig-out/bin
 
       - name: Package tarball
         id: pkg
@@ -53,10 +53,8 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="${{ env.PRODUCT }}-${VERSION}-${{ env.TARGET }}"
-          mkdir -p "dist/${NAME}/bin" "dist/${NAME}/lib" "dist/${NAME}/include"
-          cp "zig-out/bin/${{ env.PRODUCT }}" "dist/${NAME}/bin/"
-          cp "zig-out/lib/lib${{ env.PRODUCT }}.dylib" "dist/${NAME}/lib/"
-          cp "zig-out/include/${{ env.PRODUCT }}.h" "dist/${NAME}/include/"
+          mkdir -p "dist/${NAME}"
+          cp "zig-out/bin/${{ env.PRODUCT }}" "dist/${NAME}/"
           cp README.md LICENSE "dist/${NAME}/" 2>/dev/null || true
           cd dist
           tar -czf "${NAME}.tar.gz" "${NAME}"
@@ -155,9 +153,7 @@ jobs:
             end
 
             def install
-              bin.install "bin/mdctl"
-              lib.install "lib/libmdctl.dylib"
-              include.install "include/mdctl.h"
+              bin.install "mdctl"
             end
 
             test do

@@ -67,13 +67,19 @@ JSON 格式，按以下优先级合并：CLI > `./.mdctlrc`（项目）> `~/.con
 
 也可以 `mdctl --config path/to/cfg.json` 显式指定。
 
-### C ABI
+### 库形态（C ABI）
 
-链接 `libmdctl.dylib`，包含 `<mdctl.h>`：
+`brew install` 只装 CLI 二进制。如果要把 mdctl 作为库嵌入（Swift / Node N-API / Python ctypes 等），从源码编译：
+
+```bash
+zig build -Doptimize=ReleaseFast
+# 产出 zig-out/lib/libmdctl.dylib + zig-out/include/mdctl.h
+```
+
+接口示例（`include/mdctl.h`）：
 
 ```c
 #include "mdctl.h"
-
 int main(void) {
   char *out = NULL;
   size_t len = 0;
@@ -83,10 +89,6 @@ int main(void) {
     mdctl_free(out, len);
   }
 }
-```
-
-```bash
-clang -I /opt/homebrew/include -L /opt/homebrew/lib -lmdctl demo.c -o demo
 ```
 
 ## 退出码
