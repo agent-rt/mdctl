@@ -463,7 +463,7 @@ fn headingLevel(size: f64, median: f64) ?u8 {
 fn markRepeatedHeaderFooter(pages: []PageLines) void {
     if (pages.len < 3) return;
     const threshold = (pages.len * 7) / 10; // ≥70% of pages
-    const max_iters: usize = 4;
+    const max_iters: usize = 8;
 
     var iter: usize = 0;
     while (iter < max_iters) : (iter += 1) {
@@ -481,17 +481,56 @@ fn markRepeatedHeaderFooter(pages: []PageLines) void {
 }
 
 /// Drop a standalone page-number line (only digits / whitespace / a few
-/// separators) at the given edge. Returns true if a line was marked.
+/// separators, ASCII or full-width) at the given edge.
 fn markPageNumberAtEdge(p: *PageLines, edge: Edge) bool {
     const idx = edgeIndexAtDepth(p, edge, 0) orelse return false;
     const t = std.mem.trim(u8, p.lines.items[idx].text, " \t\r\n");
-    if (t.len == 0 or t.len > 12) return false;
-    for (t) |c| {
-        const ok = std.ascii.isDigit(c) or c == ' ' or c == '/' or c == '-' or c == '|' or c == '.';
-        if (!ok) return false;
+    if (t.len == 0 or t.len > 24) return false;
+    var i: usize = 0;
+    while (i < t.len) {
+        if (isPageNumChar(t, &i)) continue;
+        return false;
     }
     p.lines.items[idx].skipped = true;
     return true;
+}
+
+/// Returns true and advances `*i` if the byte (or UTF-8 codepoint starting)
+/// at position `*i` is a digit or page-number-like separator. Recognises:
+///   ASCII 0-9, space, tab, '/', '-', '|', '.'
+///   Full-width 0-9 (U+FF10..FF19), '．' (U+FF0E), '－' (U+FF0D),
+///   '・' (U+30FB), 'ー' (U+30FC)
+fn isPageNumChar(t: []const u8, i: *usize) bool {
+    const c = t[i.*];
+    if (c < 0x80) {
+        if (std.ascii.isDigit(c) or c == ' ' or c == '\t' or
+            c == '/' or c == '-' or c == '|' or c == '.')
+        {
+            i.* += 1;
+            return true;
+        }
+        return false;
+    }
+    // U+FF10..FF19 → EF BC 90..99 (full-width 0-9)
+    // U+FF0E '．'   → EF BC 8E
+    // U+FF0D '－'   → EF BC 8D
+    // U+FF0F '／'   → EF BC 8F
+    if (i.* + 2 < t.len and t[i.*] == 0xEF and t[i.* + 1] == 0xBC) {
+        const b3 = t[i.* + 2];
+        if ((b3 >= 0x90 and b3 <= 0x99) or b3 == 0x8D or b3 == 0x8E or b3 == 0x8F) {
+            i.* += 3;
+            return true;
+        }
+    }
+    // U+30FB '・' → E3 83 BB; U+30FC 'ー' → E3 83 BC
+    if (i.* + 2 < t.len and t[i.*] == 0xE3 and t[i.* + 1] == 0x83) {
+        const b3 = t[i.* + 2];
+        if (b3 == 0xBB or b3 == 0xBC) {
+            i.* += 3;
+            return true;
+        }
+    }
+    return false;
 }
 
 const Edge = enum { first, last };
