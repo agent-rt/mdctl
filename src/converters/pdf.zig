@@ -104,8 +104,11 @@ pub fn convert(
             const is_heading_like = headingLevel(line.size, median) != null and
                 looksLikeHeading(trimmed_for_code);
             const inside_code = pending_code.items.len > 0;
+            // Threshold is in bytes; CJK chars are ~3 bytes each, so 80
+            // bytes ≈ 26 CJK chars — catches typical embedded comments
+            // / string literals, stays well under typical body paragraphs.
             const fold_into_code = inside_code and !line.mono and
-                !is_heading_like and trimmed_for_code.len < 40 and
+                !is_heading_like and trimmed_for_code.len < 80 and
                 stripBulletPrefix(trimmed_for_code) == null;
             if (line.mono or fold_into_code) {
                 try flushPara(gpa, writer, &pending_para);
