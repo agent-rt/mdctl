@@ -401,20 +401,41 @@ fn ocrPageInto(gpa: std.mem.Allocator, page: pdfkit.Page, out: *PageLines) !void
 // Heading detection
 // ============================================================================
 
+/// Character-weighted median font size: each line contributes its byte
+/// length to the histogram. Short lines (TOC entries, page numbers) carry
+/// proportionally less influence than long body paragraphs, so the median
+/// converges on the actual body font size.
 fn computeMedianSize(pages: []const PageLines) f64 {
-    var collect: std.ArrayList(f64) = .empty;
-    defer collect.deinit(std.heap.page_allocator);
+    const Pair = struct { size: f64, weight: usize };
+    var pairs: std.ArrayList(Pair) = .empty;
+    defer pairs.deinit(std.heap.page_allocator);
 
+    var total_weight: usize = 0;
     for (pages) |p| {
         for (p.lines.items) |line| {
-            if (line.size > 0 and line.text.len > 0) {
-                collect.append(std.heap.page_allocator, line.size) catch return 0;
-            }
+            if (line.size <= 0 or line.text.len == 0) continue;
+            pairs.append(std.heap.page_allocator, .{
+                .size = line.size,
+                .weight = line.text.len,
+            }) catch return 0;
+            total_weight += line.text.len;
         }
     }
-    if (collect.items.len == 0) return 0;
-    std.mem.sort(f64, collect.items, {}, std.sort.asc(f64));
-    return collect.items[collect.items.len / 2];
+    if (total_weight == 0) return 0;
+
+    std.mem.sort(Pair, pairs.items, {}, struct {
+        fn lt(_: void, a: Pair, b: Pair) bool {
+            return a.size < b.size;
+        }
+    }.lt);
+
+    const target = total_weight / 2;
+    var acc: usize = 0;
+    for (pairs.items) |p| {
+        acc += p.weight;
+        if (acc >= target) return p.size;
+    }
+    return pairs.items[pairs.items.len - 1].size;
 }
 
 /// Strip leading section numbering ("１． ", "1.2.3 ") so that
@@ -478,7 +499,7 @@ fn headingLevel(size: f64, median: f64) ?u8 {
     const ratio = size / median;
     if (ratio >= 1.8) return 1;
     if (ratio >= 1.4) return 2;
-    if (ratio >= 1.15) return 3;
+    if (ratio >= 1.22) return 3;
     return null;
 }
 
@@ -819,8 +840,8 @@ test "page selection" {
 test "heading level" {
     try std.testing.expectEqual(@as(?u8, 1), headingLevel(20, 10));
     try std.testing.expectEqual(@as(?u8, 2), headingLevel(14, 10));
-    try std.testing.expectEqual(@as(?u8, 3), headingLevel(12, 10));
-    try std.testing.expectEqual(@as(?u8, null), headingLevel(11.4, 10));
+    try std.testing.expectEqual(@as(?u8, 3), headingLevel(12.3, 10));
+    try std.testing.expectEqual(@as(?u8, null), headingLevel(12.1, 10));
 }
 
 test "should break" {
