@@ -53,6 +53,21 @@ mdctl big.pdf --pdf-pages 1-3,5,10-12
 mdctl --help
 ```
 
+### 管道 + LLM
+
+直接喂给 [llmctl](https://github.com/agent-rt/llmctl)：
+
+```bash
+# 一句话概括
+mdctl spec.pdf | llmctl --system "用一句话概括这份文档"
+
+# 翻译
+mdctl https://en.wikipedia.org/wiki/Markdown | llmctl --system "翻译为简体中文"
+
+# 抽要点
+mdctl meeting-notes.docx | llmctl --system "列出 5 条 action items"
+```
+
 ### 配置文件
 
 JSON 格式，按以下优先级合并：CLI > `./.mdctlrc`（项目）> `~/.config/mdctl/config.json`（全局）：
