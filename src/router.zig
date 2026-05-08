@@ -46,13 +46,23 @@ pub fn fromExtension(path: []const u8) Format {
 pub fn fromMagic(bytes: []const u8) Format {
     if (bytes.len < 4) return .unknown;
     if (std.mem.startsWith(u8, bytes, "%PDF")) return .pdf;
-    if (std.mem.startsWith(u8, bytes, "PK\x03\x04")) return .docx; // zip; need deeper inspection for x/p/d
+    if (std.mem.startsWith(u8, bytes, "PK\x03\x04")) return ooxmlKind(bytes);
     if (bytes.len >= 3 and std.mem.startsWith(u8, bytes, "\xFF\xD8\xFF")) return .jpeg;
     if (bytes.len >= 8 and std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return .png;
     if (std.mem.startsWith(u8, bytes, "<!DO") or std.mem.startsWith(u8, bytes, "<htm") or std.mem.startsWith(u8, bytes, "<HTM")) return .html;
     if (bytes[0] == '<' and bytes.len >= 2 and (bytes[1] == '?' or std.ascii.isAlphabetic(bytes[1]))) return .xml;
     if (bytes[0] == '{' or bytes[0] == '[') return .json;
     return .unknown;
+}
+
+/// Distinguish DOCX/XLSX/PPTX by sniffing well-known internal paths in the
+/// ZIP central directory. We don't open the archive — just scan raw bytes for
+/// the unique part names. Cheap and reliable for OOXML.
+fn ooxmlKind(bytes: []const u8) Format {
+    if (std.mem.indexOf(u8, bytes, "word/document.xml") != null) return .docx;
+    if (std.mem.indexOf(u8, bytes, "xl/workbook.xml") != null) return .xlsx;
+    if (std.mem.indexOf(u8, bytes, "ppt/presentation.xml") != null) return .pptx;
+    return .docx; // default OOXML to docx; users can override via --format
 }
 
 pub fn detect(path: []const u8, bytes: []const u8) Format {

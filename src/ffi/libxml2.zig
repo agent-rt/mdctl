@@ -42,6 +42,22 @@ pub const Doc = struct {
         return .{ .raw = doc };
     }
 
+    pub fn parseXml(xml: []const u8) ?Doc {
+        if (!enabled) return null;
+        const opts: c_int =
+            c.XML_PARSE_NOERROR |
+            c.XML_PARSE_NOWARNING |
+            c.XML_PARSE_NONET;
+        const doc = c.xmlReadMemory(
+            xml.ptr,
+            @intCast(xml.len),
+            null,
+            "utf-8",
+            opts,
+        ) orelse return null;
+        return .{ .raw = doc };
+    }
+
     pub fn deinit(self: Doc) void {
         c.xmlFreeDoc(self.raw);
     }
@@ -99,6 +115,37 @@ pub const Node = struct {
         defer c.xmlFree.?(ptr);
         const slice = std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
         return try gpa.dupe(u8, slice);
+    }
+
+    /// First element child whose local name matches.
+    pub fn firstChildNamed(self: Node, name_: []const u8) ?Node {
+        var c_opt = self.firstChild();
+        while (c_opt) |child| : (c_opt = child.next()) {
+            if (child.nodeType() == .element and std.mem.eql(u8, child.name(), name_)) {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    /// Walker over element children with a matching local name.
+    pub const ChildIterator = struct {
+        next_node: ?Node,
+        target: []const u8,
+
+        pub fn next(self: *ChildIterator) ?Node {
+            while (self.next_node) |n| {
+                self.next_node = n.next();
+                if (n.nodeType() == .element and std.mem.eql(u8, n.name(), self.target)) {
+                    return n;
+                }
+            }
+            return null;
+        }
+    };
+
+    pub fn iterChildren(self: Node, target: []const u8) ChildIterator {
+        return .{ .next_node = self.firstChild(), .target = target };
     }
 };
 

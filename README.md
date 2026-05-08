@@ -18,7 +18,9 @@ v0.1 骨架阶段。已支持：
 | url | ✅ std.http.Client + 自动 readability |
 | readability | ✅ `--readable` / `--no-readable` |
 | pdf | ✅ PDFKit per-page text + `--pdf-pages 1-3,5` |
-| docx / xlsx / pptx | 🚧 v0.4 |
+| docx | ✅ heading style + bold/italic + 表格 + 超链接文本 |
+| xlsx | ✅ 多 sheet → H2 + 表格，sharedStrings + 公式缓存值 |
+| pptx | ✅ 每张幻灯片 → H2 + bullet list |
 | 图片 + EXIF + OCR | 🚧 v0.5 |
 
 ## 构建

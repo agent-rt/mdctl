@@ -59,6 +59,18 @@ pub const MdWriter = struct {
         self.needs_blank = true;
     }
 
+    /// Heading where `text` is already Markdown-escaped (e.g. from a converter
+    /// that handled escaping itself).
+    pub fn rawHeading(self: *MdWriter, level: u8, text: []const u8) !void {
+        std.debug.assert(level >= 1 and level <= 6);
+        try self.ensureBlankLine();
+        var i: u8 = 0;
+        while (i < level) : (i += 1) try self.buf.append(self.gpa, '#');
+        try self.buf.append(self.gpa, ' ');
+        try self.buf.appendSlice(self.gpa, text);
+        self.needs_blank = true;
+    }
+
     pub fn paragraph(self: *MdWriter, text: []const u8) !void {
         try self.ensureBlankLine();
         try writeEscaped(self.gpa, &self.buf, text);

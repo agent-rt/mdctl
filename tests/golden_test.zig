@@ -51,7 +51,37 @@ const cases = [_]Case{
         .expected = @embedFile("golden/html/with_noise.md"),
         .readable = true,
     },
+    .{
+        .name = "docx/sample",
+        .format = .docx,
+        .input = @embedFile("fixtures/docx/sample.docx"),
+        .expected = @embedFile("golden/docx/sample.md"),
+    },
+    .{
+        .name = "xlsx/sample",
+        .format = .xlsx,
+        .input = @embedFile("fixtures/xlsx/sample.xlsx"),
+        .expected = @embedFile("golden/xlsx/sample.md"),
+    },
+    .{
+        .name = "pptx/sample",
+        .format = .pptx,
+        .input = @embedFile("fixtures/pptx/sample.pptx"),
+        .expected = @embedFile("golden/pptx/sample.md"),
+    },
 };
+
+test "zip extract" {
+    const zip_bytes = @embedFile("fixtures/zip/test.zip");
+    const gpa = std.testing.allocator;
+    var ar = try mdctl.zip.open(gpa, zip_bytes);
+    defer ar.deinit();
+    try std.testing.expect(ar.entries.len >= 2);
+    const e = ar.entryByName("a.txt") orelse return error.NotFound;
+    const data = try ar.extract(gpa, e);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("hello\n", data);
+}
 
 test "golden corpus" {
     const gpa = std.testing.allocator;

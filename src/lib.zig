@@ -15,9 +15,13 @@ pub const xml = @import("converters/xml.zig");
 pub const html = @import("converters/html.zig");
 pub const url = @import("converters/url.zig");
 pub const pdf = @import("converters/pdf.zig");
+pub const docx = @import("converters/docx.zig");
+pub const xlsx = @import("converters/xlsx.zig");
+pub const pptx = @import("converters/pptx.zig");
 
 pub const objc = @import("ffi/objc.zig");
 pub const libxml2 = @import("ffi/libxml2.zig");
+pub const zip = @import("util/zip.zig");
 
 pub const Format = router.Format;
 pub const Options = struct {
@@ -69,6 +73,9 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
             .readable = opts.readable orelse false,
         }),
         .pdf => try pdf.convert(gpa, &writer, data, .{ .pages = opts.pdf_pages }),
+        .docx => try docx.convert(gpa, &writer, data),
+        .xlsx => try xlsx.convert(gpa, &writer, data),
+        .pptx => try pptx.convert(gpa, &writer, data),
         .unknown => {
             log.err("unsupported format for input '{s}'", .{path_hint orelse "<stdin>"});
             return errors.Error.UnsupportedFormat;
