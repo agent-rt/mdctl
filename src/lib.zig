@@ -18,6 +18,7 @@ pub const pdf = @import("converters/pdf.zig");
 pub const docx = @import("converters/docx.zig");
 pub const xlsx = @import("converters/xlsx.zig");
 pub const pptx = @import("converters/pptx.zig");
+pub const image = @import("converters/image.zig");
 
 pub const objc = @import("ffi/objc.zig");
 pub const libxml2 = @import("ffi/libxml2.zig");
@@ -33,6 +34,8 @@ pub const Options = struct {
     readable: ?bool = null,
     /// PDF: optional page ranges (1-based). Empty means all pages.
     pdf_pages: []const pdf.Range = &.{},
+    /// Images: enable Vision text recognition.
+    ocr: bool = false,
 };
 
 pub const Source = union(enum) {
@@ -76,12 +79,12 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .docx => try docx.convert(gpa, &writer, data),
         .xlsx => try xlsx.convert(gpa, &writer, data),
         .pptx => try pptx.convert(gpa, &writer, data),
+        .jpeg, .png => try image.convert(gpa, &writer, data, .{
+            .path_for_link = path_hint,
+            .ocr = opts.ocr,
+        }),
         .unknown => {
             log.err("unsupported format for input '{s}'", .{path_hint orelse "<stdin>"});
-            return errors.Error.UnsupportedFormat;
-        },
-        else => {
-            log.err("format '{s}' is not yet implemented", .{@tagName(fmt)});
             return errors.Error.UnsupportedFormat;
         },
     }

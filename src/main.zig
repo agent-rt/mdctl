@@ -19,6 +19,7 @@ const usage =
     \\  --readable        strip nav/sidebar/script noise (default on for URLs)
     \\  --no-readable     keep full document
     \\  --pdf-pages SPEC  page ranges, e.g. "1-3,5,7-9"
+    \\  --ocr             run Vision text recognition on images
     \\  -h, --help        show this help
     \\
 ;
@@ -29,6 +30,7 @@ const Args = struct {
     format: ?mdctl.Format = null,
     readable: ?bool = null,
     pdf_pages_spec: ?[]const u8 = null,
+    ocr: bool = false,
     verbose: bool = false,
     quiet: bool = false,
     help: bool = false,
@@ -61,6 +63,8 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingArgValue;
             a.pdf_pages_spec = argv[i];
+        } else if (std.mem.eql(u8, arg, "--ocr")) {
+            a.ocr = true;
         } else if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             return error.UnknownFlag;
         } else {
@@ -122,6 +126,7 @@ pub fn main(init: std.process.Init) !void {
         .format = args.format,
         .readable = args.readable,
         .pdf_pages = pdf_ranges,
+        .ocr = args.ocr,
     }) catch |e| {
         mdctl.log.err("convert failed: {s}", .{@errorName(e)});
         std.process.exit(@intFromEnum(mdctl.errors.codeFor(e)));

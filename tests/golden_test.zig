@@ -69,6 +69,12 @@ const cases = [_]Case{
         .input = @embedFile("fixtures/pptx/sample.pptx"),
         .expected = @embedFile("golden/pptx/sample.md"),
     },
+    .{
+        .name = "image/blank.png",
+        .format = .png,
+        .input = @embedFile("fixtures/image/blank.png"),
+        .expected = @embedFile("golden/image/blank.md"),
+    },
 };
 
 test "zip extract" {

@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
         mod.linkFramework("CoreFoundation", .{});
         mod.linkFramework("Quartz", .{});
         mod.linkFramework("PDFKit", .{});
+        mod.linkFramework("ImageIO", .{});
+        mod.linkFramework("Vision", .{});
         mod.link_libc = true;
         // libxml2 headers live under <SDK>/usr/include/libxml2/.
         if (xcrunSdkPath(b)) |sdk| {
