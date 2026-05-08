@@ -33,7 +33,7 @@ zig build -Doptimize=ReleaseFast
 | json | ✅ | pretty + ```json 围栏 |
 | xml | ✅ | ```xml 围栏 |
 | html | ✅ | libxml2 + turndown 算法 |
-| url | ✅ | std.http.Client + 自动 readability |
+| url | ✅ | std.http.Client + curl fallback；可选 `--readable` |
 | pdf | ✅ | PDFKit per-page text + `--pdf-pages` |
 | docx | ✅ | Heading 样式、粗斜体、表格 |
 | xlsx | ✅ | sharedStrings + 多 sheet → 表格 |

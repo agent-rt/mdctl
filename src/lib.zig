@@ -54,7 +54,7 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
             const body = try url.fetch(gpa, io, p);
             defer gpa.free(body);
             try html.convertWithOptions(gpa, &writer, body, .{
-                .readable = opts.readable orelse true,
+                .readable = opts.readable orelse false,
                 .base_url = p,
             });
             return try writer.toOwnedSlice();
