@@ -97,6 +97,8 @@ fn parseFormat(s: []const u8) ?mdctl.Format {
 }
 
 pub fn main(init: std.process.Init) !void {
+    silenceAppleFrameworkLogs();
+
     const gpa = init.gpa;
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
@@ -200,6 +202,17 @@ fn readOne(gpa: std.mem.Allocator, io: Io, path: []const u8) !mdctl.config.Confi
     defer list.deinit(gpa);
     try fr.interface.appendRemainingUnlimited(gpa, &list);
     return mdctl.config.parse(gpa, list.items);
+}
+
+/// Silence Apple frameworks' NSLog/os_log spam (PDFKit emits
+/// "attributedStringScaled count: 1" for every page, etc). Apple reads these
+/// env vars at framework init, so we set them before any framework call.
+fn silenceAppleFrameworkLogs() void {
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    };
+    _ = c.setenv("OS_ACTIVITY_MODE", "disable", 0);
+    _ = c.setenv("CFLOG_FORCE_DISABLE_STDERR", "1", 0);
 }
 
 fn writeStdout(io: Io, bytes: []const u8) !void {

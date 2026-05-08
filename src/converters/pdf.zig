@@ -177,12 +177,71 @@ fn collectPageLines(gpa: std.mem.Allocator, page: pdfkit.Page) !PageLines {
         const is_nl = !at_end and buf.items[i] == '\n';
         if (!is_nl and !at_end) continue;
         const slice = buf.items[line_start..i];
-        const text = try gpa.dupe(u8, slice);
-        const max = maxSize(sizes.items[line_start..i]);
-        try page_lines.lines.append(gpa, .{ .text = text, .size = max });
+        const cleaned = stripDotLeader(slice);
+        if (cleaned.len > 0) {
+            const text = try gpa.dupe(u8, cleaned);
+            const max = maxSize(sizes.items[line_start..i]);
+            try page_lines.lines.append(gpa, .{ .text = text, .size = max });
+        }
         line_start = i + 1;
     }
     return page_lines;
+}
+
+/// Strip trailing runs of dot-leader characters (commonly seen in PDF
+/// tables of contents). Only strips when the trailing run contains at least
+/// 2 leader characters, so legitimate sentence-ending periods are preserved.
+fn stripDotLeader(line: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+
+    // Walk from end, counting leader bytes, until we hit a non-leader.
+    var keep_end: usize = trimmed.len;
+    var leaders: usize = 0;
+    while (keep_end > 0) {
+        // Match multi-byte UTF-8 leader codepoints.
+        if (keep_end >= 3 and std.mem.eql(u8, trimmed[keep_end - 3 .. keep_end], "\xE2\x80\xA6")) {
+            keep_end -= 3;
+            leaders += 1;
+            continue;
+        }
+        if (keep_end >= 3 and std.mem.eql(u8, trimmed[keep_end - 3 .. keep_end], "\xE2\x80\xA2")) {
+            keep_end -= 3;
+            leaders += 1;
+            continue;
+        }
+        if (keep_end >= 2 and std.mem.eql(u8, trimmed[keep_end - 2 .. keep_end], "\xC2\xB7")) {
+            keep_end -= 2;
+            leaders += 1;
+            continue;
+        }
+        const last = trimmed[keep_end - 1];
+        if (last == '_' or last == '.') {
+            keep_end -= 1;
+            leaders += 1;
+            continue;
+        }
+        if (last == ' ' or last == '\t') {
+            // Whitespace is allowed inside the run but doesn't count as a leader.
+            keep_end -= 1;
+            continue;
+        }
+        break;
+    }
+
+    if (leaders < 2) return trimmed; // not a dot-leader run
+    return std.mem.trimEnd(u8, trimmed[0..keep_end], " \t");
+}
+
+test "strip dot-leader trailing underscores" {
+    try std.testing.expectEqualStrings("Heading", stripDotLeader("Heading _____________"));
+    try std.testing.expectEqualStrings("Item 1", stripDotLeader("Item 1 ........."));
+    try std.testing.expectEqualStrings("", stripDotLeader("________________"));
+}
+
+test "strip dot-leader preserves sentences" {
+    try std.testing.expectEqualStrings("Body text.", stripDotLeader("Body text."));
+    try std.testing.expectEqualStrings("Mr. Smith said hi.", stripDotLeader("Mr. Smith said hi."));
 }
 
 fn maxSize(slice: []const f64) f64 {
