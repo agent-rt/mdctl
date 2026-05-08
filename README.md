@@ -14,7 +14,9 @@ v0.1 骨架阶段。已支持：
 | csv | ✅ Markdown 表格 |
 | json | ✅ pretty + ```json |
 | xml | ✅ ```xml（结构化渲染待 v0.2） |
-| html / url | 🚧 v0.2 |
+| html | ✅ libxml2 + turndown 算法 |
+| url | ✅ std.http.Client + 自动 readability |
+| readability | ✅ `--readable` / `--no-readable` |
 | pdf | 🚧 v0.3 |
 | docx / xlsx / pptx | 🚧 v0.4 |
 | 图片 + EXIF + OCR | 🚧 v0.5 |

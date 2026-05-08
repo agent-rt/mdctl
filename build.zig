@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .macos) {
         mod.linkSystemLibrary("objc", .{});
+        mod.linkSystemLibrary("xml2", .{});
+        mod.link_libc = true;
+        // libxml2 headers live under <SDK>/usr/include/libxml2/.
+        if (xcrunSdkPath(b)) |sdk| {
+            const inc = b.fmt("{s}/usr/include/libxml2", .{sdk});
+            mod.addSystemIncludePath(.{ .cwd_relative = inc });
+        }
     }
 
     const exe = b.addExecutable(.{
@@ -52,4 +59,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_golden_tests.step);
+}
+
+fn xcrunSdkPath(b: *std.Build) ?[]const u8 {
+    var code: u8 = undefined;
+    const out = b.runAllowFail(
+        &.{ "xcrun", "--show-sdk-path" },
+        &code,
+        .inherit,
+    ) catch return null;
+    if (code != 0) return null;
+    return std.mem.trimEnd(u8, out, " \t\r\n");
 }

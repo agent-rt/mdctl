@@ -16,6 +16,8 @@ const usage =
     \\  --format FMT      override format detection
     \\  -v, --verbose     verbose logging (info)
     \\  -q, --quiet       only errors
+    \\  --readable        strip nav/sidebar/script noise (default on for URLs)
+    \\  --no-readable     keep full document
     \\  -h, --help        show this help
     \\
 ;
@@ -24,6 +26,7 @@ const Args = struct {
     input: ?[]const u8 = null,
     out: ?[]const u8 = null,
     format: ?mdctl.Format = null,
+    readable: ?bool = null,
     verbose: bool = false,
     quiet: bool = false,
     help: bool = false,
@@ -48,6 +51,10 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingArgValue;
             a.format = parseFormat(argv[i]) orelse return error.UnknownFormat;
+        } else if (std.mem.eql(u8, arg, "--readable")) {
+            a.readable = true;
+        } else if (std.mem.eql(u8, arg, "--no-readable")) {
+            a.readable = false;
         } else if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             return error.UnknownFlag;
         } else {
@@ -96,7 +103,10 @@ pub fn main(init: std.process.Init) !void {
     else
         .{ .path = args.input.? };
 
-    const out = mdctl.convert(gpa, init.io, source, .{ .format = args.format }) catch |e| {
+    const out = mdctl.convert(gpa, init.io, source, .{
+        .format = args.format,
+        .readable = args.readable,
+    }) catch |e| {
         mdctl.log.err("convert failed: {s}", .{@errorName(e)});
         std.process.exit(@intFromEnum(mdctl.errors.codeFor(e)));
     };

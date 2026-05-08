@@ -10,6 +10,7 @@ const Case = struct {
     format: mdctl.Format,
     input: []const u8,
     expected: []const u8,
+    readable: ?bool = null,
 };
 
 const cases = [_]Case{
@@ -37,6 +38,19 @@ const cases = [_]Case{
         .input = @embedFile("fixtures/xml/note.xml"),
         .expected = @embedFile("golden/xml/note.md"),
     },
+    .{
+        .name = "html/basic",
+        .format = .html,
+        .input = @embedFile("fixtures/html/basic.html"),
+        .expected = @embedFile("golden/html/basic.md"),
+    },
+    .{
+        .name = "html/with_noise (readable)",
+        .format = .html,
+        .input = @embedFile("fixtures/html/with_noise.html"),
+        .expected = @embedFile("golden/html/with_noise.md"),
+        .readable = true,
+    },
 };
 
 test "golden corpus" {
@@ -45,7 +59,7 @@ test "golden corpus" {
     for (cases) |c| {
         const out = try mdctl.convert(gpa, undefined, .{
             .bytes = .{ .data = c.input, .hint_path = null },
-        }, .{ .format = c.format });
+        }, .{ .format = c.format, .readable = c.readable });
         defer gpa.free(out);
 
         if (!std.mem.eql(u8, out, c.expected)) {

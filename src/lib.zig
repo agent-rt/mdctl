@@ -12,14 +12,20 @@ pub const txt = @import("converters/txt.zig");
 pub const csv = @import("converters/csv.zig");
 pub const json = @import("converters/json.zig");
 pub const xml = @import("converters/xml.zig");
+pub const html = @import("converters/html.zig");
+pub const url = @import("converters/url.zig");
 
 pub const objc = @import("ffi/objc.zig");
+pub const libxml2 = @import("ffi/libxml2.zig");
 
 pub const Format = router.Format;
 pub const Options = struct {
     md: md_writer.Options = .{},
     /// If null, format is auto-detected from path + magic.
     format: ?Format = null,
+    /// HTML/URL: trim navigation/sidebar/script noise before conversion.
+    /// Defaults to true for URL inputs, false for local HTML files.
+    readable: ?bool = null,
 };
 
 pub const Source = union(enum) {
@@ -29,6 +35,20 @@ pub const Source = union(enum) {
 
 /// Convert a source to Markdown. Caller owns the returned slice.
 pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options) ![]u8 {
+    if (source == .path) {
+        const p = source.path;
+        if (std.mem.startsWith(u8, p, "http://") or std.mem.startsWith(u8, p, "https://")) {
+            var writer = md_writer.MdWriter.init(gpa, opts.md);
+            defer writer.deinit();
+            const body = try url.fetch(gpa, io, p);
+            defer gpa.free(body);
+            try html.convertWithOptions(gpa, &writer, body, .{
+                .readable = opts.readable orelse true,
+            });
+            return try writer.toOwnedSlice();
+        }
+    }
+
     const data, const path_hint = try loadBytes(gpa, io, source);
     defer if (sourceOwnsBytes(source)) gpa.free(data);
 
@@ -42,6 +62,9 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .csv => try csv.convert(gpa, &writer, data),
         .json => try json.convert(gpa, &writer, data),
         .xml => try xml.convert(&writer, data),
+        .html => try html.convertWithOptions(gpa, &writer, data, .{
+            .readable = opts.readable orelse false,
+        }),
         .unknown => {
             log.err("unsupported format for input '{s}'", .{path_hint orelse "<stdin>"});
             return errors.Error.UnsupportedFormat;
