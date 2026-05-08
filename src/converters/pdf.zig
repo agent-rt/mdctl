@@ -87,15 +87,35 @@ pub fn convert(
     var last_heading: std.ArrayList(u8) = .empty;
     defer last_heading.deinit(gpa);
     var lines_since_heading: usize = 0;
+    var pending_code: std.ArrayList(u8) = .empty;
+    defer pending_code.deinit(gpa);
 
     for (pages.items) |page_data| {
-        // Page boundary: flush whatever was buffered. Otherwise the last
-        // line of page N and the first line of page N+1 get joined by the
-        // reflow heuristic into one paragraph (e.g. "...ください。 Microsoft,
-        // Windows..."), which never reads as one paragraph in the source.
+        // Page boundary: flush whatever was buffered.
         try flushPara(gpa, writer, &pending_para);
+        try flushCode(gpa, writer, &pending_code);
         for (page_data.lines.items) |line| {
             if (line.skipped) continue;
+            const trimmed_for_code = std.mem.trim(u8, line.text, " \t\r\n");
+            // Code lines accumulate into a fenced block. While we're in a
+            // code block, a short non-mono interruption (e.g. a Chinese
+            // string literal embedded in a Java call) is folded back in so
+            // the block doesn't shatter on every font transition.
+            const is_heading_like = headingLevel(line.size, median) != null and
+                looksLikeHeading(trimmed_for_code);
+            const inside_code = pending_code.items.len > 0;
+            const fold_into_code = inside_code and !line.mono and
+                !is_heading_like and trimmed_for_code.len < 40 and
+                stripBulletPrefix(trimmed_for_code) == null;
+            if (line.mono or fold_into_code) {
+                try flushPara(gpa, writer, &pending_para);
+                if (pending_code.items.len > 0) try pending_code.append(gpa, '\n');
+                try pending_code.appendSlice(gpa, trimmed_for_code);
+                lines_since_heading += 1;
+                continue;
+            } else if (pending_code.items.len > 0) {
+                try flushCode(gpa, writer, &pending_code);
+            }
             const trimmed_text = std.mem.trim(u8, line.text, " \t\r\n");
             const lvl_opt = headingLevel(line.size, median);
             if (lvl_opt) |h| {
@@ -159,7 +179,15 @@ pub fn convert(
         }
     }
     try flushPara(gpa, writer, &pending_para);
+    try flushCode(gpa, writer, &pending_code);
     try writer.finish();
+}
+
+fn flushCode(gpa: std.mem.Allocator, writer: *md.MdWriter, buf: *std.ArrayList(u8)) !void {
+    if (buf.items.len == 0) return;
+    try writer.codeBlock("", buf.items);
+    _ = gpa;
+    buf.clearRetainingCapacity();
 }
 
 // ============================================================================
@@ -170,12 +198,11 @@ const Line = struct {
     text: []u8, // owned
     size: f64, // representative font size (max within line)
     skipped: bool = false, // true after header/footer dedup
-    /// true → preceded by a \n in the source (start of a new physical line).
-    /// false → split off a previous segment by a font-size change only.
     starts_physical_line: bool = true,
-    /// true → original line ended with a dot-leader run (TOC entry).
-    /// Caller forces a paragraph break after this line.
     had_dot_leader: bool = false,
+    /// True when the majority of the line was rendered in a monospace font
+    /// — caller emits as a fenced code block.
+    mono: bool = false,
 };
 
 const PageLines = struct {
@@ -196,23 +223,25 @@ fn collectPageLines(gpa: std.mem.Allocator, page: pdfkit.Page) !PageLines {
     defer buf.deinit(gpa);
     var sizes: std.ArrayList(f64) = .empty;
     defer sizes.deinit(gpa);
+    var monos: std.ArrayList(u8) = .empty; // 1 = mono, 0 = proportional
+    defer monos.deinit(gpa);
 
     const Ctx = struct {
         gpa: std.mem.Allocator,
         page: pdfkit.Page,
         buf: *std.ArrayList(u8),
         sizes: *std.ArrayList(f64),
+        monos: *std.ArrayList(u8),
     };
-    var ctx = Ctx{ .gpa = gpa, .page = page, .buf = &buf, .sizes = &sizes };
+    var ctx = Ctx{ .gpa = gpa, .page = page, .buf = &buf, .sizes = &sizes, .monos = &monos };
 
     try page.forEachFontRun(&ctx, struct {
-        fn cb(c: *Ctx, off: usize, len: usize, size: f64) anyerror!void {
+        fn cb(c: *Ctx, off: usize, len: usize, size: f64, mono: bool) anyerror!void {
             const sub = try c.page.substring(c.gpa, off, len);
             defer c.gpa.free(sub);
             try c.buf.appendSlice(c.gpa, sub);
-            // Append `size` for each *byte* of UTF-8; for the heuristics this
-            // is good enough (lines are split on \n which is a single byte).
             try c.sizes.appendNTimes(c.gpa, size, sub.len);
+            try c.monos.appendNTimes(c.gpa, @intFromBool(mono), sub.len);
         }
     }.cb);
 
@@ -241,11 +270,13 @@ fn collectPageLines(gpa: std.mem.Allocator, page: pdfkit.Page) !PageLines {
 
         if (stripped.len > 0) {
             const sizes_slice = sizes.items[line_start + lead_trim ..];
+            const monos_slice = monos.items[line_start + lead_trim ..];
             try emitLineWithFontSplits(
                 gpa,
                 &page_lines,
                 stripped,
                 sizes_slice[0..@min(stripped.len, sizes_slice.len)],
+                monos_slice[0..@min(stripped.len, monos_slice.len)],
                 had_leader,
             );
         }
@@ -263,6 +294,7 @@ fn emitLineWithFontSplits(
     page_lines: *PageLines,
     text: []const u8,
     sizes: []const f64,
+    monos: []const u8,
     had_leader: bool,
 ) !void {
     if (text.len == 0) return;
@@ -275,21 +307,35 @@ fn emitLineWithFontSplits(
         const at_end = i == text.len;
         const size_change = !at_end and i < sizes.len and i - 1 < sizes.len and
             @abs(sizes[i] - sizes[i - 1]) > epsilon;
-        if (!size_change and !at_end) continue;
+        const mono_change = !at_end and i < monos.len and i - 1 < monos.len and
+            monos[i] != monos[i - 1];
+        if (!size_change and !mono_change and !at_end) continue;
 
         const seg = std.mem.trim(u8, text[seg_start..i], " \t\r\n");
         if (seg.len > 0) {
-            const max = maxSize(sizes[seg_start..@min(i, sizes.len)]);
+            const slice_end = @min(i, sizes.len);
+            const max = maxSize(sizes[seg_start..slice_end]);
+            const seg_mono = isMostlyMono(monos[seg_start..@min(i, monos.len)]);
             try page_lines.lines.append(gpa, .{
                 .text = try gpa.dupe(u8, seg),
                 .size = max,
                 .starts_physical_line = first_segment,
                 .had_dot_leader = at_end and had_leader,
+                .mono = seg_mono,
             });
             first_segment = false;
         }
         seg_start = i;
     }
+}
+
+fn isMostlyMono(monos: []const u8) bool {
+    if (monos.len == 0) return false;
+    var n: usize = 0;
+    for (monos) |m| if (m != 0) {
+        n += 1;
+    };
+    return n * 2 > monos.len; // majority of bytes were mono-font
 }
 
 /// Strip trailing runs of dot-leader characters (commonly seen in PDF

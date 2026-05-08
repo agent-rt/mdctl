@@ -72,12 +72,14 @@ pub const Page = struct {
         return nsStringToUtf8(gpa, ns);
     }
 
-    /// Walk the page's attributedString; for each run of identical font size
-    /// the callback receives (utf16_offset, utf16_length, font_size).
+    /// Walk the page's attributedString; for each run of identical font the
+    /// callback receives (utf16_offset, utf16_length, font_size, mono).
+    /// `mono` is heuristically true when the font's PostScript name contains
+    /// 'Mono', 'Courier', 'Menlo', 'Consolas', 'Code', or 'Source'.
     pub fn forEachFontRun(
         self: Page,
         ctx: anytype,
-        comptime callback: fn (@TypeOf(ctx), usize, usize, f64) anyerror!void,
+        comptime callback: fn (@TypeOf(ctx), usize, usize, f64, bool) anyerror!void,
     ) !void {
         const attr = objc.send0(objc.Id, self.raw, "attributedString");
         if (attr == null) return;
@@ -96,8 +98,20 @@ pub const Page = struct {
                 &range,
             );
             if (range.length == 0) break;
-            const size: f64 = if (font != null) objc.send0(f64, font, "pointSize") else 0;
-            try callback(ctx, range.location, range.length, size);
+            var size: f64 = 0;
+            var mono = false;
+            if (font != null) {
+                size = objc.send0(f64, font, "pointSize");
+                const ns_name = objc.send0(objc.Id, font, "fontName");
+                if (ns_name != null) {
+                    const cstr = objc.send0([*c]const u8, ns_name, "UTF8String");
+                    if (cstr != null) {
+                        const name = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
+                        mono = isMonoFontName(name);
+                    }
+                }
+            }
+            try callback(ctx, range.location, range.length, size, mono);
             i = range.location + range.length;
         }
     }
@@ -147,6 +161,19 @@ pub const Page = struct {
         return nsStringToUtf8(gpa, sub);
     }
 };
+
+fn isMonoFontName(name: []const u8) bool {
+    const needles = [_][]const u8{
+        "Mono",     "mono",     "Courier", "courier",
+        "Menlo",    "menlo",    "Consolas", "consolas",
+        "Code",     "code",     "SourceCode", "Source Code",
+        "Hack",     "Inconsolata", "Fira Code",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, name, n) != null) return true;
+    }
+    return false;
+}
 
 pub const NSRange = extern struct { location: usize, length: usize };
 pub const NSSize = extern struct { width: f64, height: f64 };
