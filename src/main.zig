@@ -18,6 +18,7 @@ const usage =
     \\  -q, --quiet       only errors
     \\  --readable        strip nav/sidebar/script noise (default on for URLs)
     \\  --no-readable     keep full document
+    \\  --pdf-pages SPEC  page ranges, e.g. "1-3,5,7-9"
     \\  -h, --help        show this help
     \\
 ;
@@ -27,6 +28,7 @@ const Args = struct {
     out: ?[]const u8 = null,
     format: ?mdctl.Format = null,
     readable: ?bool = null,
+    pdf_pages_spec: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
     help: bool = false,
@@ -55,6 +57,10 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             a.readable = true;
         } else if (std.mem.eql(u8, arg, "--no-readable")) {
             a.readable = false;
+        } else if (std.mem.eql(u8, arg, "--pdf-pages")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingArgValue;
+            a.pdf_pages_spec = argv[i];
         } else if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             return error.UnknownFlag;
         } else {
@@ -103,9 +109,19 @@ pub fn main(init: std.process.Init) !void {
     else
         .{ .path = args.input.? };
 
+    const pdf_ranges: []mdctl.pdf.Range = if (args.pdf_pages_spec) |spec|
+        mdctl.pdf.parsePageRanges(gpa, spec) catch {
+            mdctl.log.err("invalid --pdf-pages spec: {s}", .{spec});
+            std.process.exit(@intFromEnum(mdctl.errors.ExitCode.bad_input));
+        }
+    else
+        &.{};
+    defer if (pdf_ranges.len > 0) gpa.free(pdf_ranges);
+
     const out = mdctl.convert(gpa, init.io, source, .{
         .format = args.format,
         .readable = args.readable,
+        .pdf_pages = pdf_ranges,
     }) catch |e| {
         mdctl.log.err("convert failed: {s}", .{@errorName(e)});
         std.process.exit(@intFromEnum(mdctl.errors.codeFor(e)));

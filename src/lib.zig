@@ -14,6 +14,7 @@ pub const json = @import("converters/json.zig");
 pub const xml = @import("converters/xml.zig");
 pub const html = @import("converters/html.zig");
 pub const url = @import("converters/url.zig");
+pub const pdf = @import("converters/pdf.zig");
 
 pub const objc = @import("ffi/objc.zig");
 pub const libxml2 = @import("ffi/libxml2.zig");
@@ -26,6 +27,8 @@ pub const Options = struct {
     /// HTML/URL: trim navigation/sidebar/script noise before conversion.
     /// Defaults to true for URL inputs, false for local HTML files.
     readable: ?bool = null,
+    /// PDF: optional page ranges (1-based). Empty means all pages.
+    pdf_pages: []const pdf.Range = &.{},
 };
 
 pub const Source = union(enum) {
@@ -65,6 +68,7 @@ pub fn convert(gpa: std.mem.Allocator, io: std.Io, source: Source, opts: Options
         .html => try html.convertWithOptions(gpa, &writer, data, .{
             .readable = opts.readable orelse false,
         }),
+        .pdf => try pdf.convert(gpa, &writer, data, .{ .pages = opts.pdf_pages }),
         .unknown => {
             log.err("unsupported format for input '{s}'", .{path_hint orelse "<stdin>"});
             return errors.Error.UnsupportedFormat;

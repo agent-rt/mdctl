@@ -17,7 +17,7 @@ v0.1 骨架阶段。已支持：
 | html | ✅ libxml2 + turndown 算法 |
 | url | ✅ std.http.Client + 自动 readability |
 | readability | ✅ `--readable` / `--no-readable` |
-| pdf | 🚧 v0.3 |
+| pdf | ✅ PDFKit per-page text + `--pdf-pages 1-3,5` |
 | docx / xlsx / pptx | 🚧 v0.4 |
 | 图片 + EXIF + OCR | 🚧 v0.5 |
 

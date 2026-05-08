@@ -11,6 +11,10 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         mod.linkSystemLibrary("objc", .{});
         mod.linkSystemLibrary("xml2", .{});
+        mod.linkFramework("Foundation", .{});
+        mod.linkFramework("CoreFoundation", .{});
+        mod.linkFramework("Quartz", .{});
+        mod.linkFramework("PDFKit", .{});
         mod.link_libc = true;
         // libxml2 headers live under <SDK>/usr/include/libxml2/.
         if (xcrunSdkPath(b)) |sdk| {

@@ -1,23 +1,24 @@
 //! Objective-C runtime helpers. See docs/research.md §8.2.
 //!
-//! All ObjC framework calls (PDFKit, Vision, ImageIO, Speech) must be wrapped
-//! in `withPool` to avoid leaking autoreleased objects across batch items.
-//! This module is a thin shim over <objc/runtime.h> + <objc/message.h>.
-//!
-//! v0.1: only autoreleasepool. msgSend wrappers land with v0.3 PDFKit.
+//! All ObjC framework calls must run inside `withPool` to flush autoreleased
+//! objects. msgSend is exposed via a typed cast helper because `objc_msgSend`
+//! itself is variadic and the Apple ABI requires the call site to know the
+//! exact signature.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const enabled = builtin.os.tag == .macos;
 
-const c = if (enabled) @cImport({
-    @cInclude("objc/runtime.h");
-    @cInclude("objc/message.h");
-}) else struct {};
+pub const Id = ?*opaque {};
+pub const Class = ?*opaque {};
+pub const Sel = ?*opaque {};
 
 extern "objc" fn objc_autoreleasePoolPush() ?*anyopaque;
 extern "objc" fn objc_autoreleasePoolPop(pool: ?*anyopaque) void;
+extern "objc" fn objc_getClass(name: [*:0]const u8) Class;
+extern "objc" fn sel_registerName(name: [*:0]const u8) Sel;
+extern "objc" fn objc_msgSend() void;
 
 /// Run `body` inside a fresh autoreleasepool. Required around any ObjC call.
 /// Mirrors `@autoreleasepool { ... }` in Objective-C.
@@ -28,6 +29,60 @@ pub fn withPool(comptime R: type, body: anytype) R {
     return body();
 }
 
+/// Manual pool push. Caller must invoke `popPool` on the returned token,
+/// preferably via `defer`. Use `withPool` when no captured state is needed.
+pub fn pushPool() ?*anyopaque {
+    if (!enabled) return null;
+    return objc_autoreleasePoolPush();
+}
+
+pub fn popPool(token: ?*anyopaque) void {
+    if (!enabled) return;
+    objc_autoreleasePoolPop(token);
+}
+
+pub fn getClass(name: [*:0]const u8) Class {
+    return objc_getClass(name);
+}
+
+pub fn sel(name: [*:0]const u8) Sel {
+    return sel_registerName(name);
+}
+
+// objc_msgSend has variable signatures depending on the selector. Apple's ABI
+// requires the call site to use the exact typed pointer (especially on arm64).
+// Zig 0.16 lacks `@Type` for synthesizing function types from runtime tuples,
+// so we expose hand-written arity-specific wrappers. Add more as needed.
+
+pub fn send0(comptime Ret: type, receiver: anytype, selector_name: [*:0]const u8) Ret {
+    const Fn = *const fn (@TypeOf(receiver), Sel) callconv(.c) Ret;
+    const f: Fn = @ptrCast(&objc_msgSend);
+    return f(receiver, sel_registerName(selector_name));
+}
+
+pub fn send1(
+    comptime Ret: type,
+    receiver: anytype,
+    selector_name: [*:0]const u8,
+    a1: anytype,
+) Ret {
+    const Fn = *const fn (@TypeOf(receiver), Sel, @TypeOf(a1)) callconv(.c) Ret;
+    const f: Fn = @ptrCast(&objc_msgSend);
+    return f(receiver, sel_registerName(selector_name), a1);
+}
+
+pub fn send2(
+    comptime Ret: type,
+    receiver: anytype,
+    selector_name: [*:0]const u8,
+    a1: anytype,
+    a2: anytype,
+) Ret {
+    const Fn = *const fn (@TypeOf(receiver), Sel, @TypeOf(a1), @TypeOf(a2)) callconv(.c) Ret;
+    const f: Fn = @ptrCast(&objc_msgSend);
+    return f(receiver, sel_registerName(selector_name), a1, a2);
+}
+
 test "withPool noop" {
     const r = withPool(i32, struct {
         fn call() i32 {
@@ -35,4 +90,10 @@ test "withPool noop" {
         }
     }.call);
     try std.testing.expectEqual(@as(i32, 42), r);
+}
+
+test "objc class lookup" {
+    if (!enabled) return error.SkipZigTest;
+    const NSString = getClass("NSString");
+    try std.testing.expect(NSString != null);
 }
